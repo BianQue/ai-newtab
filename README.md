@@ -30,7 +30,7 @@ You need Chrome (or another Chromium browser), [Node.js](https://nodejs.org) 20+
 and an [Anthropic API key](https://console.anthropic.com).
 
 ```bash
-git clone https://github.com/ThariqS/ai-newtab.git
+git clone https://github.com/BianQue/ai-newtab.git
 cd ai-newtab
 npx pnpm@10.11.1 install
 npx pnpm@10.11.1 build
@@ -136,13 +136,30 @@ the gotchas worth knowing.
 packages/agent-core   the agent loop: host-agnostic, no chrome.* or node:*
 apps/extension        the MV3 extension (WXT + React)
 harness               Bun scripts that run agent-core outside Chrome, and test the built extension
+apps/ma-emulator      a local Managed Agents API server (see its README)
 ```
+
+### Running against the local emulator
+
+`apps/ma-emulator` serves the Managed Agents endpoints (`/v1/agents`,
+`/v1/sessions`, ...) on your machine and forwards model calls to any
+Anthropic-compatible gateway. To use it:
+
+```bash
+# .env: MA_UPSTREAM_BASE_URL=https://your-gateway  (key comes from the client)
+pnpm emulator            # listens on http://127.0.0.1:8787
+```
+
+Then point the extension at it, either with
+`WXT_ANTHROPIC_BASE_URL=http://127.0.0.1:8787` in `apps/extension/.env` before
+building, or by entering that URL as the gateway on the key screen.
 
 ```bash
 pnpm dev                 # WXT with hot reload
 pnpm typecheck           # all packages
 pnpm test                # unit tests (no API calls; needs Bun)
 pnpm extension:test      # loads the built extension into headless Chrome (no API calls)
+pnpm emulator:e2e        # full extension build through the emulator, killing the worker mid-build
 
 cp .env.example .env     # add ANTHROPIC_API_KEY, then:
 pnpm agent:run           # a full build against the real API, with fixture history
