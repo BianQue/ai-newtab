@@ -1,9 +1,10 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { buildHistoryDigest, slugifyUrl } from "./history-digest";
-import { OUTPUT_PATH, buildKickoffMessage } from "./prompt";
+import { HOMEPAGE_SYSTEM_PROMPT, OUTPUT_PATH, buildKickoffMessage } from "./prompt";
 import { DEFAULT_BLOCKED_SITES, isAllowedUrl, isBlocked, normalizeBlockList } from "./site-filter";
 import { DEFAULTS } from "./schemas";
-import { STORAGE_KEYS, ensureAgent, ensureEnvironment, type HomepageModel } from "./setup";
+import { DEFAULT_MODEL, HOMEPAGE_TOOLS, STORAGE_KEYS, type HomepageModel } from "./setup";
+import { OUTPUT_ROOT, UPLOAD_ROOT, WORKSPACE_TOOL_NAMES, Workspace } from "./workspace";
 import type {
   BrowserBridge,
   GetHistoryResult,
@@ -15,8 +16,9 @@ import type {
   RunPhase,
 } from "./types";
 
-type SessionEvent = Anthropic.Beta.Sessions.BetaManagedAgentsSessionEvent;
-type CustomToolUse = Anthropic.Beta.Sessions.BetaManagedAgentsAgentCustomToolUseEvent;
+type MessageParam = Anthropic.MessageParam;
+type ToolUse = Anthropic.ToolUseBlock;
+type ToolResult = Anthropic.ToolResultBlockParam;
 
 /** Callbacks with the optionality resolved, so call sites don't repeat `?.`. */
 interface Emit {
@@ -25,10 +27,18 @@ interface Emit {
   log(line: string): void;
 }
 
-const MANAGED_AGENTS_BETA = "managed-agents-2026-04-01";
+/** Model calls per build. A normal build takes 10–25; past this something is looping. */
+const MAX_TURNS = 60;
+/** Room for the component itself, which arrives as one `write` tool input. */
+const MAX_TOKENS = 32_000;
 
-/** Files mount under this root no matter what path you ask for. Ask for it directly. */
-const UPLOAD_ROOT = "/mnt/session/uploads";
+/** Everything needed to pick a build back up after the host was killed mid-run. */
+interface Checkpoint {
+  runId: string;
+  model: HomepageModel;
+  messages: MessageParam[];
+  files: Record<string, string>;
+}
 
 export interface RunOptions {
   client: Anthropic;
@@ -40,11 +50,11 @@ export interface RunOptions {
    * so a list saved mid-build applies to the rest of that build.
    */
   blockedSites?: string[] | (() => Promise<string[]>);
-  /** Ignored when resuming: the session keeps the agent (and model) it started with. */
+  /** Ignored when resuming: the build keeps the model it started with. */
   model?: HomepageModel;
   callbacks?: RunCallbacks;
   signal?: AbortSignal;
-  /** Reattach to an existing session instead of creating one (e.g. after the host was killed mid-run). */
+  /** Continue a checkpointed build instead of starting one (e.g. after the host was killed mid-run). */
   resumeSessionId?: string;
   now?: Date;
 }
@@ -58,203 +68,153 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
   };
 
   emit.phase("setup");
-  const [agentId, environmentId] = await Promise.all([
-    ensureAgent(client, store, opts.model),
-    ensureEnvironment(client, store),
-  ]);
-  emit.log(`agent=${agentId} environment=${environmentId}`);
-
-  let sessionId = opts.resumeSessionId;
-  if (!sessionId) {
-    emit.phase("session-create");
-    const session = await client.beta.sessions.create({
-      agent: agentId,
-      environment_id: environmentId,
-      title: `Homepage ${(opts.now ?? new Date()).toISOString().slice(0, 10)}`,
-    });
-    sessionId = session.id;
-    await store.set(STORAGE_KEYS.activeSessionId, sessionId);
+  let checkpoint: Checkpoint | undefined;
+  if (opts.resumeSessionId) {
+    const saved = await store.get<Checkpoint>(STORAGE_KEYS.buildCheckpoint);
+    if (saved?.runId === opts.resumeSessionId) checkpoint = saved;
+    else emit.log(`no checkpoint for ${opts.resumeSessionId}; starting a fresh build`);
   }
-  emit.log(`session=${sessionId}`);
+  if (!checkpoint) emit.phase("session-create");
 
-  // Persist upload IDs so cleanup can still find them after a reattach.
-  const uploadedFileIds: string[] =
-    (await store.get<string[]>(STORAGE_KEYS.uploadedFileIds)) ?? [];
-  const rememberUpload = async (id: string) => {
-    uploadedFileIds.push(id);
-    await store.set(STORAGE_KEYS.uploadedFileIds, uploadedFileIds);
+  const runId = checkpoint?.runId ?? `build_${Date.now().toString(36)}`;
+  const model = checkpoint?.model ?? opts.model ?? DEFAULT_MODEL;
+  const workspace = new Workspace(checkpoint?.files);
+  const messages: MessageParam[] = checkpoint?.messages ?? [
+    {
+      role: "user",
+      content: buildKickoffMessage({ now: opts.now ?? new Date(), userSystemPrompt: opts.userSystemPrompt }),
+    },
+  ];
+  await store.set(STORAGE_KEYS.activeSessionId, runId);
+  emit.log(`build=${runId} model=${model}${checkpoint ? ` resumed at ${messages.length} messages` : ""}`);
+  const tail = messages[messages.length - 1]!;
+  if (checkpoint && tail.role === "assistant" && typeof tail.content !== "string") {
+    const pending = tail.content.filter((b) => b.type === "tool_use").length;
+    if (pending) emit.log(`re-answering ${pending} orphaned tool call(s)`);
+  }
+
+  const saveCheckpoint = async () => {
+    const next: Checkpoint = { runId, model, messages, files: workspace.snapshot() };
+    try {
+      await store.set(STORAGE_KEYS.buildCheckpoint, next);
+    } catch (err) {
+      // Most likely the storage quota. The build carries on; it just can't be resumed.
+      emit.log(`checkpoint not saved: ${String(err)}`);
+    }
   };
 
-  let finalMessage = "";
-
-  /**
-   * Every path out of here must send a result. An `agent.custom_tool_use` that
-   * never receives one leaves the session idle forever — the single
-   * unrecoverable bug in this design.
-   */
-  const dispatch = async (event: CustomToolUse): Promise<void> => {
+  /** Every tool_use must get a tool_result, or the next request is rejected. Errors are results too. */
+  const dispatch = async (use: ToolUse): Promise<ToolResult> => {
     try {
       const blockedSites = normalizeBlockList(
         (typeof opts.blockedSites === "function" ? await opts.blockedSites() : opts.blockedSites) ?? DEFAULT_BLOCKED_SITES,
       );
-      let result: GetHistoryResult | GetPageHtmlResult;
-      switch (event.name) {
-        case "getHistory":
-          result = await runGetHistory(event, bridge, emit, blockedSites);
-          break;
-        case "getPageHtml":
-          result = await runGetPageHtml(event, { client, bridge, sessionId: sessionId!, rememberUpload, emit, blockedSites });
-          break;
-        default:
-          throw new Error(`Unknown custom tool: ${event.name}`);
+      let text: string;
+      if (use.name === "getHistory") {
+        text = JSON.stringify(await runGetHistory(use, bridge, emit, blockedSites));
+      } else if (use.name === "getPageHtml") {
+        text = JSON.stringify(await runGetPageHtml(use, { bridge, workspace, emit, blockedSites }));
+      } else if ((WORKSPACE_TOOL_NAMES as readonly string[]).includes(use.name)) {
+        emit.phase("analyzing", use.name);
+        emit.log(`workspace:${use.name} ${describeInput(use.input)}`);
+        text = workspace.run(use.name, use.input as Record<string, unknown>);
+      } else {
+        throw new Error(`Unknown tool: ${use.name}`);
       }
-
-      await client.beta.sessions.events.send(sessionId!, {
-        events: [
-          {
-            type: "user.custom_tool_result",
-            custom_tool_use_id: event.id,
-            content: [{ type: "text", text: JSON.stringify(result) }],
-          },
-        ],
-      });
+      return { type: "tool_result", tool_use_id: use.id, content: [{ type: "text", text }] };
     } catch (err) {
-      emit.log(`tool ${event.name} failed: ${String(err)}`);
-      await client.beta.sessions.events.send(sessionId!, {
-        events: [
-          {
-            type: "user.custom_tool_result",
-            custom_tool_use_id: event.id,
-            is_error: true,
-            content: [{ type: "text", text: String(err) }],
-          },
-        ],
-      });
+      emit.log(`tool ${use.name} failed: ${String(err)}`);
+      return { type: "tool_result", tool_use_id: use.id, is_error: true, content: [{ type: "text", text: String(err) }] };
     }
   };
 
-  const observe = (event: SessionEvent) => {
-    switch (event.type) {
-      case "agent.message":
-        for (const block of event.content) {
-          if (block.type === "text") {
-            finalMessage += block.text;
-            emit.text(block.text);
-          }
-        }
-        break;
-      case "agent.thinking":
-        emit.phase("thinking");
-        break;
-      case "agent.tool_use":
-        emit.phase("analyzing", event.name);
-        emit.log(`sandbox:${event.name}`);
-        break;
-      case "session.error":
-        emit.log(`session.error: ${JSON.stringify(event)}`);
-        break;
+  let finalMessage = "";
+  // Replay narration from a checkpoint, so a reattached view isn't blank.
+  for (const message of messages) {
+    if (message.role !== "assistant" || typeof message.content === "string") continue;
+    for (const block of message.content) {
+      if (block.type === "text") {
+        finalMessage += block.text;
+        emit.text(block.text);
+      }
     }
-  };
+  }
 
   try {
-    // ---- Open the stream BEFORE anything else. It only delivers events emitted
-    // ---- after it opens; send first and the early transitions are gone.
-    let stream = await client.beta.sessions.events.stream(sessionId, undefined, { signal });
+    for (let turn = 0; ; ) {
+      if (signal?.aborted) throw new Error("aborted");
 
-    // ---- Then replay history. Covers the gap before the stream attached, and
-    // ---- is what makes a reattach lossless.
-    const history: SessionEvent[] = [];
-    for await (const event of client.beta.sessions.events.list(sessionId)) {
-      history.push(event);
-    }
-
-    const seen = new Set(history.map((e) => e.id));
-    const answered = new Set(
-      history
-        .filter((e): e is Extract<SessionEvent, { type: "user.custom_tool_result" }> =>
-          e.type === "user.custom_tool_result",
-        )
-        .map((e) => e.custom_tool_use_id),
-    );
-    const kickedOff = history.some((e) => e.type === "user.message");
-    const alreadyDone = history.some(
-      (e) => e.type === "session.status_idle" && e.stop_reason.type === "end_turn",
-    );
-
-    for (const event of history) observe(event);
-
-    if (!alreadyDone) {
-      // Re-answer any tool call that was left hanging when the stream dropped.
-      for (const event of history) {
-        if (event.type === "agent.custom_tool_use" && !answered.has(event.id)) {
-          emit.log(`re-answering orphaned tool call ${event.id}`);
-          await dispatch(event);
-        }
+      // Answer the last assistant turn's tool calls. After a resume this also
+      // covers calls that were made but never answered before the host died.
+      const last = messages[messages.length - 1]!;
+      if (last.role === "assistant") {
+        const uses = typeof last.content === "string" ? [] : last.content.filter((b): b is ToolUse => b.type === "tool_use");
+        if (uses.length === 0) break; // end of turn: the model is done.
+        const results: ToolResult[] = [];
+        for (const use of uses) results.push(await dispatch(use));
+        messages.push({ role: "user", content: results });
+        await saveCheckpoint();
+        continue;
       }
 
-      if (!kickedOff) {
-        await client.beta.sessions.events.send(sessionId, {
-          events: [
-            {
-              type: "user.message",
-              content: [
-                {
-                  type: "text",
-                  text: buildKickoffMessage({
-                    now: opts.now ?? new Date(),
-                    userSystemPrompt: opts.userSystemPrompt,
-                  }),
-                },
-              ],
-            },
-          ],
-        });
-      }
+      if (++turn > MAX_TURNS) throw new Error(`Gave up after ${MAX_TURNS} model turns without a finished homepage.`);
+      emit.phase("thinking");
+      const stream = client.messages.stream(
+        {
+          model,
+          max_tokens: MAX_TOKENS,
+          system: [{ type: "text", text: HOMEPAGE_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
+          tools: HOMEPAGE_TOOLS,
+          messages: withCacheBreakpoint(messages),
+        },
+        { signal },
+      );
+      stream.on("text", (chunk) => {
+        finalMessage += chunk;
+        emit.text(chunk);
+      });
+      const reply = await stream.finalMessage();
+      messages.push({ role: "assistant", content: reply.content });
+      await saveCheckpoint();
 
-      for await (const event of stream) {
-        if (signal?.aborted) throw new Error("aborted");
-
-        // Live-preview events carry no `id` and are never terminal. They only
-        // arrive if `event_deltas` was requested, but the stream union includes
-        // them either way — reading `.id` off one would throw.
-        if (event.type === "event_start" || event.type === "event_delta") continue;
-
-        if (!seen.has(event.id)) {
-          seen.add(event.id);
-          observe(event);
-          if (event.type === "agent.custom_tool_use") {
-            await dispatch(event);
-          }
-        }
-
-        // Terminal checks run for *every* event, including ones we've already
-        // seen. `continue`-ing on a duplicate above would skip the terminal
-        // event that arrived in the history fetch, and the loop would never end.
-        if (event.type === "session.status_terminated") break;
-        if (event.type === "session.status_idle" && event.stop_reason.type !== "requires_action") {
-          emit.log(`idle: ${event.stop_reason.type}`);
-          break;
-        }
+      if (reply.stop_reason === "max_tokens" && reply.content.some((b) => b.type === "tool_use")) {
+        throw new Error(`The model ran out of output tokens (${MAX_TOKENS}) in the middle of a tool call.`);
       }
     }
 
     emit.phase("writing");
-    const code = await collectDeliverable(client, sessionId, finalMessage, emit);
+    const code = collectDeliverable(workspace, finalMessage, emit);
     emit.phase("done");
-    return { code: code.code, sessionId, source: code.source };
+    return { code: code.code, sessionId: runId, source: code.source };
   } finally {
-    // Privacy: the event log holds every domain, title and page body we sent,
-    // and uploads persist independently of the session. Delete both, always.
+    // Privacy: the checkpoint holds every domain, title and page body the model
+    // saw. It exists only to survive a host kill; any other exit drops it.
     emit.phase("cleanup");
-    await Promise.allSettled(uploadedFileIds.map((id) => client.beta.files.delete(id)));
-    await store.remove(STORAGE_KEYS.uploadedFileIds);
-    if (sessionId) {
-      await deleteSessionWhenSettled(client, sessionId).catch((err) =>
-        emit.log(`session ${sessionId} was not deleted: ${String(err)}`),
-      );
-    }
+    await store.remove(STORAGE_KEYS.buildCheckpoint);
     await store.remove(STORAGE_KEYS.activeSessionId);
   }
+}
+
+/**
+ * Cache the conversation up to its newest message. The system prompt + tools
+ * carry a breakpoint of their own; old message breakpoints are dropped so the
+ * request never exceeds the four-breakpoint limit.
+ */
+function withCacheBreakpoint(messages: MessageParam[]): MessageParam[] {
+  const last = messages[messages.length - 1]!;
+  const blocks: Anthropic.ContentBlockParam[] =
+    typeof last.content === "string" ? [{ type: "text", text: last.content }] : [...last.content];
+  const tail = blocks[blocks.length - 1];
+  if (tail && tail.type !== "thinking" && tail.type !== "redacted_thinking") {
+    blocks[blocks.length - 1] = { ...tail, cache_control: { type: "ephemeral" } };
+  }
+  return [...messages.slice(0, -1), { ...last, content: blocks }];
+}
+
+function describeInput(input: unknown): string {
+  const { content, ...rest } = (input ?? {}) as Record<string, unknown>;
+  const shown = JSON.stringify(rest);
+  return typeof content === "string" ? `${shown} (+${content.length} chars)` : shown;
 }
 
 // ---------------------------------------------------------------------------
@@ -262,12 +222,12 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
 // ---------------------------------------------------------------------------
 
 async function runGetHistory(
-  event: CustomToolUse,
+  use: ToolUse,
   bridge: BrowserBridge,
   emit: Emit,
   blockedSites: string[],
 ): Promise<GetHistoryResult> {
-  const input = event.input as { daysToAnalyze?: number; maxResults?: number };
+  const input = use.input as { daysToAnalyze?: number; maxResults?: number };
   const daysToAnalyze = input.daysToAnalyze ?? DEFAULTS.daysToAnalyze;
   const maxResults = input.maxResults ?? DEFAULTS.maxResults;
 
@@ -285,17 +245,15 @@ async function runGetHistory(
 }
 
 async function runGetPageHtml(
-  event: CustomToolUse,
+  use: ToolUse,
   ctx: {
-    client: Anthropic;
     bridge: BrowserBridge;
-    sessionId: string;
-    rememberUpload: (id: string) => Promise<void>;
+    workspace: Workspace;
     emit: Emit;
     blockedSites: string[];
   },
 ): Promise<GetPageHtmlResult> {
-  const input = event.input as { urls: string[]; loadDelayMs?: number };
+  const input = use.input as { urls: string[]; loadDelayMs?: number };
   ctx.emit.phase("scraping", `${input.urls.length} pages`);
 
   const allowed: string[] = [];
@@ -314,7 +272,7 @@ async function runGetPageHtml(
       })
     : { pages: [], failed: [] };
 
-  // A redirect can land on a blocked host; drop what it read before anything is uploaded.
+  // A redirect can land on a blocked host; drop what it read before anything is stored.
   const pages = loaded.filter((page) => {
     if (!page.finalUrl || isAllowedUrl(page.finalUrl, ctx.blockedSites)) return true;
     blocked.push({ url: page.url, reason: "blocked by the user's settings" });
@@ -323,47 +281,24 @@ async function runGetPageHtml(
   if (blocked.length) ctx.emit.log(`blocked: ${blocked.length} url(s)`);
 
   const refs: PageRef[] = [];
-  const mountFailures = [...blocked, ...failed];
-
   for (const page of pages) {
-    try {
-      const filename = `${slugifyUrl(page.url)}_${refs.length}.html`;
-      const upload = await ctx.client.beta.files.upload({
-        file: new File([page.html], filename, { type: "text/html" }),
-      });
-      await ctx.rememberUpload(upload.id);
-
-      // Mount mid-session, while the session idles awaiting this very result.
-      // The API re-roots every mount under /mnt/session/uploads (see below).
-      const resource = await ctx.client.beta.sessions.resources.add(ctx.sessionId, {
-        type: "file",
-        file_id: upload.id,
-        mount_path: `${UPLOAD_ROOT}/pages/${filename}`,
-      });
-
-      refs.push({
-        url: page.url,
-        title: page.title,
-        // The API re-roots every mount under /mnt/session/uploads. Report what it
-        // resolved, not what we asked for, or the model greps a path that isn't there.
-        mountPath: resource.mount_path,
-        bytes: page.html.length,
-      });
-      ctx.emit.log(`mounted ${page.url} -> ${resource.mount_path} (${page.html.length}b)`);
-    } catch (err) {
-      mountFailures.push({ url: page.url, reason: `mount failed: ${String(err)}` });
-    }
+    // Sanitized HTML is often minified onto a handful of lines; one tag per line
+    // makes grep hits and read ranges meaningful.
+    const html = page.html.replace(/>\s*</g, ">\n<");
+    const filename = `${slugifyUrl(page.url)}_${refs.length}.html`;
+    const mountPath = ctx.workspace.put(`${UPLOAD_ROOT}/pages/${filename}`, html);
+    refs.push({ url: page.url, title: page.title, mountPath, bytes: html.length });
+    ctx.emit.log(`stored ${page.url} -> ${mountPath} (${html.length}b)`);
   }
 
-  if (refs.length === 0 && mountFailures.length > 0 && blocked.length === 0) {
+  const failures = [...blocked, ...failed];
+  if (refs.length === 0 && failures.length > 0 && blocked.length === 0) {
     throw new Error(
-      `No pages could be mounted. Failures: ${mountFailures
-        .map((f) => `${f.url} (${f.reason})`)
-        .join("; ")}`,
+      `No pages could be loaded. Failures: ${failures.map((f) => `${f.url} (${f.reason})`).join("; ")}`,
     );
   }
 
-  return { pages: refs, failed: mountFailures };
+  return { pages: refs, failed: failures };
 }
 
 // ---------------------------------------------------------------------------
@@ -375,70 +310,36 @@ const CODE_FENCE = /```(?:tsx|jsx|ts|js|typescript|javascript)?\s*\n([\s\S]*?)``
 /** Strip a ```tsx fence, if the model wrapped the file contents in one. */
 function stripFence(text: string): string {
   const fenced = text.match(CODE_FENCE);
-  return (fenced ? fenced[1] : text).trim();
+  return (fenced ? fenced[1]! : text).trim();
 }
 
-async function collectDeliverable(
-  client: Anthropic,
-  sessionId: string,
+function collectDeliverable(
+  workspace: Workspace,
   finalMessage: string,
   emit: Emit,
-): Promise<{ code: string; source: HomepageBuildResult["source"] }> {
-  // There is a short indexing lag between status_idle and outputs appearing.
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      for await (const file of client.beta.files.list({
-        scope_id: sessionId,
-        betas: [MANAGED_AGENTS_BETA],
-      })) {
-        if (!/\.(tsx|jsx|ts|js)$/.test(file.filename)) continue;
-        const response = await client.beta.files.download(file.id);
-        const text = await response.text();
-        if (text.trim()) {
-          emit.log(`deliverable from session output: ${file.filename} (${text.length}b)`);
-          return { code: stripFence(text), source: "session-output" };
-        }
-      }
-    } catch (err) {
-      emit.log(`files.list attempt ${attempt + 1} failed: ${String(err)}`);
+): { code: string; source: HomepageBuildResult["source"] } {
+  const candidates = [
+    OUTPUT_PATH,
+    ...workspace.paths().filter((p) => p.startsWith(OUTPUT_ROOT + "/") && /\.(tsx|jsx|ts|js)$/.test(p)),
+  ];
+  for (const path of candidates) {
+    const text = workspace.get(path);
+    if (text?.trim()) {
+      emit.log(`deliverable from workspace output: ${path} (${text.length}b)`);
+      return { code: stripFence(text), source: "session-output" };
     }
-    await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
   }
 
   // Fallback: the model sometimes answers with the component inline instead of
   // (or as well as) writing it. Better than failing the run outright.
   const fenced = finalMessage.match(CODE_FENCE);
-  if (fenced && fenced[1].includes("PersonalizedHomepage")) {
+  if (fenced && fenced[1]!.includes("PersonalizedHomepage")) {
     emit.log("deliverable recovered from message fence");
-    return { code: fenced[1].trim(), source: "message-fence" };
+    return { code: fenced[1]!.trim(), source: "message-fence" };
   }
 
   throw new Error(
     `Agent produced no homepage. Expected a file at ${OUTPUT_PATH}. ` +
       `Final message: ${finalMessage.slice(0, 400)}`,
   );
-}
-
-/**
- * A running session can't be deleted ("cannot delete while running"). After a
- * normal finish that's only the brief lag between the stream's idle and the
- * queryable status. After a cancel or error the agent is still mid-turn, so it
- * gets interrupted and has to reach a safe boundary before it goes idle.
- */
-const SETTLE_POLLS_BEFORE_INTERRUPT = 10;
-const INTERRUPT_DEADLINE_MS = 60_000;
-
-async function deleteSessionWhenSettled(client: Anthropic, sessionId: string): Promise<void> {
-  const deadline = Date.now() + INTERRUPT_DEADLINE_MS;
-  let interrupted = false;
-  for (let attempt = 0; Date.now() < deadline; attempt++) {
-    const session = await client.beta.sessions.retrieve(sessionId);
-    if (session.status !== "running") break;
-    if (!interrupted && attempt >= SETTLE_POLLS_BEFORE_INTERRUPT) {
-      await client.beta.sessions.events.send(sessionId, { events: [{ type: "user.interrupt" }] });
-      interrupted = true;
-    }
-    await new Promise((r) => setTimeout(r, interrupted ? 1000 : 200));
-  }
-  await client.beta.sessions.delete(sessionId);
 }

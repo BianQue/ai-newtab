@@ -14,6 +14,7 @@ export function SettingsModal({
   onChangeInterval,
   onClose,
   onSave,
+  onChangeKey,
 }: {
   initialPrompt: string;
   blockedSites: string[];
@@ -25,6 +26,7 @@ export function SettingsModal({
   onChangeInterval: (next: number) => void;
   onClose: () => void;
   onSave: (prompt: string, blockedSites: string[]) => void;
+  onChangeKey: () => void;
 }) {
   const [draft, setDraft] = useState(initialPrompt);
   const [blockedDraft, setBlockedDraft] = useState(blockedSites.join("\n"));
@@ -135,6 +137,12 @@ export function SettingsModal({
           your next tab shows a fresh one (uses your API key).
         </p>
         <div style={{ display: "flex", gap: 12, marginTop: 20, justifyContent: "flex-end" }}>
+          <button
+            onClick={onChangeKey}
+            style={{ ...btn, backgroundColor: "white", color: "#333", border: "1px solid #ddd", marginRight: "auto" }}
+          >
+            Change API key / gateway
+          </button>
           <button
             onClick={onClose}
             style={{ ...btn, backgroundColor: "white", color: "#333", border: "1px solid #ddd" }}

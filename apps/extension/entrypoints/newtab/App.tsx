@@ -14,6 +14,7 @@ import { useHomepageBuild } from "./useHomepageBuild";
 export default function App() {
   const [loading, setLoading] = useState(true);
   const [apiKey, setApiKey] = useState<string | null>(null);
+  const [baseUrl, setBaseUrl] = useState<string | null>(null);
   const [systemPrompt, setSystemPrompt] = useState("");
   const [blockedSites, setBlockedSites] = useState<string[]>(DEFAULT_BLOCKED_SITES);
   const [model, setModel] = useState<HomepageModel>(DEFAULT_MODEL);
@@ -47,6 +48,7 @@ export default function App() {
           extensionStore.get<string>(KEYS.activeSessionId),
         ]);
         setApiKey(settings.apiKey);
+        setBaseUrl(settings.baseUrl);
         setSystemPrompt(settings.systemPrompt);
         setBlockedSites(settings.blockedSites);
         setModel(settings.model);
@@ -60,9 +62,17 @@ export default function App() {
     })();
   }, []);
 
-  const saveKey = useCallback(async (key: string) => {
-    await saveSetting("apiKey", key);
+  const saveKey = useCallback(async (key: string, nextBaseUrl: string | null) => {
+    await Promise.all([saveSetting("apiKey", key), saveSetting("baseUrl", nextBaseUrl)]);
+    setBaseUrl(nextBaseUrl);
     setApiKey(key);
+  }, []);
+
+  /** Back to the key screen, prefilled with the current gateway. */
+  const changeKey = useCallback(async () => {
+    await saveSetting("apiKey", null);
+    setShowSettings(false);
+    setApiKey(null);
   }, []);
 
   const savePrompt = useCallback(
@@ -92,7 +102,7 @@ export default function App() {
   }, []);
 
   if (loading) return <div style={{ padding: 20, textAlign: "center" }}>Loading…</div>;
-  if (!apiKey) return <ApiKeySetup onSave={saveKey} />;
+  if (!apiKey) return <ApiKeySetup initialBaseUrl={baseUrl} onSave={saveKey} />;
 
   // With no homepage to fall back to, a running build takes over the tab.
   if (state.running && (!renderedCode || viewProgress)) {
@@ -125,6 +135,12 @@ export default function App() {
               Resume interrupted build
             </button>
           )}
+          <button
+            style={{ ...btn, backgroundColor: "white", color: "#333", border: "1px solid #ddd" }}
+            onClick={changeKey}
+          >
+            Change API key / gateway
+          </button>
         </div>
       </div>
     );
@@ -217,6 +233,7 @@ export default function App() {
           onChangeInterval={changeInterval}
           onClose={() => setShowSettings(false)}
           onSave={savePrompt}
+          onChangeKey={changeKey}
         />
       )}
     </div>

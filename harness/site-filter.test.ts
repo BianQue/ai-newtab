@@ -21,56 +21,70 @@ test("matches hosts and subdomains without matching lookalikes", () => {
   expect(isBlocked("google.com.evil.test", ["google.com"])).toBe(false);
 });
 
-/** Exercise live and replayed tool dispatch without a network or browser. */
+/** Exercise live and resumed tool dispatch without a network or browser. */
 async function runTools(urls: string[], blockedSites?: string[] | (() => Promise<string[]>), resume = false, afterHistory?: () => void, scrape?: BrowserBridge["getPageHtml"]) {
-  const results: any[] = [];
-  const uploads: string[] = [];
+  const results: Record<string, any> = {};
   const calls: string[][] = [];
   const logs: string[] = [];
-  const events = [
-    { id: "history", type: "agent.custom_tool_use", name: "getHistory", input: { maxResults: 1 } },
-    { id: "pages", type: "agent.custom_tool_use", name: "getPageHtml", input: { urls } },
+  const checkpoints: any[] = [];
+  const toolUse = (id: string, name: string, input: unknown) => ({ role: "assistant", content: [{ type: "tool_use", id, name, input }] });
+  const historyCall = toolUse("history", "getHistory", { maxResults: 1 });
+  const pagesCall = toolUse("pages", "getPageHtml", { urls });
+  // Replies the fake model gives, in order. A resumed build starts with getPageHtml already called.
+  const replies = [
+    ...(resume ? [] : [historyCall, pagesCall]),
+    toolUse("write", "write", { path: "/mnt/session/outputs/homepage.tsx", content: "export default function PersonalizedHomepage() {}" }),
+    { role: "assistant", content: [{ type: "text", text: "Done." }] },
   ];
-  async function* stream() { if (!resume) yield* events; }
-  const client = { beta: {
-    agents: { retrieve: async () => ({}) },
-    environments: { retrieve: async () => ({}) },
-    sessions: {
-      create: async () => ({ id: "session" }),
-      retrieve: async () => ({ status: "idle" }), delete: async () => {},
-      resources: { add: async (_id: string, body: any) => ({ mount_path: body.mount_path }) },
-      events: {
-        stream: async () => stream(),
-        list: async function* () { if (resume) yield* events; },
-        send: async (_id: string, body: any) => {
-          const toolResults = body.events.filter((e: any) => e.type === "user.custom_tool_result");
-          results.push(...toolResults);
-          if (toolResults.some((e: any) => e.custom_tool_use_id === "history")) afterHistory?.();
-        },
-      },
-    },
-    files: {
-      list: async function* () { yield { id: "output", filename: "homepage.tsx" }; },
-      download: async () => new Response("export default function PersonalizedHomepage() {}"),
-      upload: async ({ file }: { file: File }) => { uploads.push(file.name); return { id: `file-${uploads.length}` }; },
-      delete: async () => {},
+  const client = { messages: {
+    stream: (params: any) => {
+      for (const message of params.messages) {
+        if (typeof message.content === "string") continue;
+        for (const block of message.content) {
+          if (block.type !== "tool_result" || results[block.tool_use_id]) continue;
+          results[block.tool_use_id] = block;
+          if (block.tool_use_id === "history") afterHistory?.();
+        }
+      }
+      const reply = replies.shift()!;
+      const stop_reason = reply.content.some((b: any) => b.type === "tool_use") ? "tool_use" : "end_turn";
+      return { on() { return this; }, finalMessage: async () => ({ ...reply, stop_reason }) };
     },
   } } as unknown as Anthropic;
+  const data = new Map<string, unknown>();
+  if (resume) {
+    data.set("buildCheckpoint", { runId: "session", model: "claude-sonnet-5-5", files: {}, messages: [
+      { role: "user", content: "Build today's homepage." },
+      historyCall,
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "history", content: [{ type: "text", text: "{}" }] }] },
+      pagesCall,
+    ] });
+  }
   const store: KVStore = {
-    get: async <T>(key: string) => (key === "uploadedFileIds" ? [] : "cached") as T,
-    set: async () => {}, remove: async () => {},
+    get: async <T>(key: string) => data.get(key) as T,
+    set: async (key, value) => { data.set(key, structuredClone(value)); if (key === "buildCheckpoint") checkpoints.push(structuredClone(value)); },
+    remove: async (key) => { data.delete(key); },
   };
   const bridge: BrowserBridge = {
     getHistory: async () => ({ sites: fixtureHistory(), totalSitesSeen: fixtureHistory().length }),
     getPageHtml: scrape ?? (async ({ urls }) => { calls.push(urls); return { pages: [], failed: urls.map(url => ({ url, reason: "unavailable" })) }; }),
   };
-  await runHomepageBuild({ client, store, bridge, blockedSites, resumeSessionId: resume ? "session" : undefined, callbacks: { onLog: line => logs.push(line) } });
-  return { results, calls, logs, uploads };
+  const result = await runHomepageBuild({ client, store, bridge, blockedSites, resumeSessionId: resume ? "session" : undefined, callbacks: { onLog: line => logs.push(line) } });
+  const files: Record<string, string> = checkpoints.at(-1)?.files ?? {};
+  const stored = Object.keys(files).filter(path => path.includes("/pages/"));
+  return { results, calls, logs, stored, files, result, leftovers: [...data.keys()] };
 }
+
+test("finishes with the written component and leaves nothing behind", async () => {
+  const { result, leftovers } = await runTools(["https://public.test"], []);
+  expect(result.code).toContain("PersonalizedHomepage");
+  expect(result.source).toBe("session-output");
+  expect(leftovers).toEqual([]);
+});
 
 test("filters history before capping and excludes blocked sites from the count", async () => {
   const { results } = await runTools([], ["news.ycombinator.com"]);
-  const digest = JSON.parse(results[0].content[0].text);
+  const digest = JSON.parse(results.history.content[0].text);
   expect(digest.totalSitesSeen).toBe(fixtureHistory().length - 1);
   expect(digest.sites).toHaveLength(1);
   expect(JSON.stringify(digest)).not.toContain("news.ycombinator.com");
@@ -84,9 +98,9 @@ test("uses newly saved blocked sites for the next tool call in an active build",
     false,
     () => { savedSites = ["news.ycombinator.com"]; },
   );
-  expect(JSON.stringify(JSON.parse(results[0].content[0].text))).toContain("news.ycombinator.com");
+  expect(JSON.stringify(JSON.parse(results.history.content[0].text))).toContain("news.ycombinator.com");
   expect(calls).toEqual([]);
-  expect(JSON.parse(results[1].content[0].text)).toEqual({
+  expect(JSON.parse(results.pages.content[0].text)).toEqual({
     pages: [],
     failed: [{ url: "https://news.ycombinator.com", reason: "blocked by the user's settings" }],
   });
@@ -97,8 +111,8 @@ test("never forwards blocked or non-http URLs, including on resume", async () =>
   for (const resume of [false, true]) {
     const { results, calls, logs } = await runTools(urls, ["bank.test"], resume);
     expect(calls).toEqual([]);
-    expect(results[1].is_error).toBeUndefined();
-    expect(JSON.parse(results[1].content[0].text)).toEqual({ pages: [], failed: urls.map(url => ({ url, reason: "blocked by the user's settings" })) });
+    expect(results.pages.is_error).toBeUndefined();
+    expect(JSON.parse(results.pages.content[0].text)).toEqual({ pages: [], failed: urls.map(url => ({ url, reason: "blocked by the user's settings" })) });
     expect(logs).toContain("blocked: 8 url(s)");
   }
 });
@@ -106,7 +120,7 @@ test("never forwards blocked or non-http URLs, including on resume", async () =>
 test("only forwards allowed URLs in mixed batches", async () => {
   const { results, calls } = await runTools(["https://bank.test", "https://public.test"], ["bank.test"]);
   expect(calls).toEqual([["https://public.test"]]);
-  expect(JSON.parse(results[1].content[0].text).failed).toEqual([
+  expect(JSON.parse(results.pages.content[0].text).failed).toEqual([
     { url: "https://bank.test", reason: "blocked by the user's settings" },
     { url: "https://public.test", reason: "unavailable" },
   ]);
@@ -132,17 +146,18 @@ test("always blocks loopback, private and local-network hosts", () => {
   }
 });
 
-test("drops pages that redirected to a blocked host before uploading them", async () => {
+test("drops pages that redirected to a blocked host before storing them", async () => {
   const redirector = "https://www.google.com/url?q=https://mail.google.com/";
-  const { results, uploads } = await runTools([redirector, "https://public.test/"], ["mail.google.com"], false, undefined, async ({ urls }) => ({
+  const { results, stored, files } = await runTools([redirector, "https://public.test/"], ["mail.google.com"], false, undefined, async ({ urls }) => ({
     pages: [
       { url: urls[0]!, finalUrl: "https://mail.google.com/mail/u/0/", title: "Inbox", html: "<p>secret</p>" },
       { url: urls[1]!, finalUrl: "https://public.test/", title: "Public", html: "<p>news</p>" },
     ],
     failed: [],
   }));
-  const out = JSON.parse(results[1].content[0].text);
-  expect(uploads).toHaveLength(1);
+  const out = JSON.parse(results.pages.content[0].text);
+  expect(stored).toHaveLength(1);
+  expect(JSON.stringify(files)).not.toContain("secret");
   expect(out.pages.map((p: any) => p.url)).toEqual(["https://public.test/"]);
   expect(out.failed).toEqual([{ url: redirector, reason: "blocked by the user's settings" }]);
   expect(JSON.stringify(out)).not.toContain("Inbox");

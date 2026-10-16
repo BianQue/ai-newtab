@@ -141,7 +141,7 @@ export class BuildManager {
       return; // single-flight: a second start just attaches.
     }
 
-    const { apiKey, systemPrompt, model } = await loadSettings();
+    const { apiKey, baseUrl, systemPrompt, model } = await loadSettings();
     if (!apiKey) {
       // Manual builds are gated behind the key-setup screen and auto-builds
       // require a key, so this only happens if the key was removed.
@@ -162,7 +162,9 @@ export class BuildManager {
     try {
       // The key is the user's own, read from local storage — there is no server
       // to hide it behind. See ARCHITECTURE.md → Privacy.
-      const client = new Anthropic({ apiKey, dangerouslyAllowBrowser: true });
+      // Optional third-party gateway: the one saved in the UI, else the build-time default.
+      const baseURL = baseUrl || import.meta.env.WXT_ANTHROPIC_BASE_URL || undefined;
+      const client = new Anthropic({ apiKey, baseURL, dangerouslyAllowBrowser: true });
 
       const resumeSessionId = opts.resume
         ? await extensionStore.get<string>(KEYS.activeSessionId)

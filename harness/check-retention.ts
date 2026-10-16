@@ -1,14 +1,15 @@
 /**
- * Privacy check: the session event log holds every domain, title and page body
- * we sent, and uploaded files persist independently. Confirm both are gone after
- * a build.
+ * Privacy check: while a build runs, its checkpoint holds every domain, title
+ * and page body the model saw. Nothing is uploaded or kept server-side (the
+ * build runs on the plain Messages API), so the only copy is the local
+ * checkpoint — confirm it is gone after a build.
  *
- * Run: pnpm agent:retention [sessionId]   (sessionId is printed by pnpm agent:run)
+ * Run: pnpm agent:retention   (after pnpm agent:run)
  */
-import Anthropic from "@anthropic-ai/sdk";
+import { STORAGE_KEYS } from "@homepage/agent-core";
+import { FileKVStore, STATE_PATH } from "./node-bridge";
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
-const sessionId = process.argv[2];
+const store = new FileKVStore(STATE_PATH);
 
 let failures = 0;
 const check = (label: string, pass: boolean) => {
@@ -16,30 +17,7 @@ const check = (label: string, pass: boolean) => {
   if (!pass) failures++;
 };
 
-if (sessionId) {
-  let gone = false;
-  try {
-    const session = await client.beta.sessions.retrieve(sessionId);
-    gone = session.status === "terminated";
-    console.log(`   session ${sessionId} still retrievable, status=${session.status}`);
-  } catch (err: any) {
-    gone = err?.status === 404;
-    if (!gone) console.log(`   unexpected error: ${err?.status} ${err?.message}`);
-  }
-  check(`session ${sessionId} deleted`, gone);
-}
-
-// Any file we uploaded for mounting is an HTML page body. None should survive.
-const lingering: string[] = [];
-for await (const file of client.beta.files.list()) {
-  if (file.mime_type === "text/html" || /\.html$/.test(file.filename)) {
-    lingering.push(`${file.id} ${file.filename} (${file.size_bytes}b)`);
-  }
-}
-check(`no scraped page bodies left in the Files API`, lingering.length === 0);
-if (lingering.length) {
-  console.log("   lingering:");
-  for (const l of lingering.slice(0, 10)) console.log(`     ${l}`);
-}
+check("no build checkpoint (page bodies) left in the store", !(await store.get(STORAGE_KEYS.buildCheckpoint)));
+check("no build marked as in flight", !(await store.get(STORAGE_KEYS.activeSessionId)));
 
 process.exit(failures === 0 ? 0 : 1);

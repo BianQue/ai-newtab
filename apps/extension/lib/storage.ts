@@ -15,6 +15,8 @@ import {
  */
 export const KEYS = {
   ...AGENT_KEYS,
+  /** Optional Anthropic-compatible gateway; unset means api.anthropic.com. */
+  baseUrl: "baseUrl",
   homepage: "homepageData",
   systemPrompt: "systemPrompt",
   blockedSites: "blockedSites",
@@ -36,6 +38,8 @@ export interface Homepage {
 
 export interface Settings {
   apiKey: string | null;
+  /** Gateway origin, already normalized; null means the build-time default or api.anthropic.com. */
+  baseUrl: string | null;
   systemPrompt: string;
   blockedSites: string[];
   model: HomepageModel;
@@ -61,6 +65,7 @@ export const extensionStore: KVStore = {
 export async function loadSettings(): Promise<Settings> {
   const s = await browser.storage.local.get([
     KEYS.apiKey,
+    KEYS.baseUrl,
     KEYS.systemPrompt,
     KEYS.blockedSites,
     KEYS.model,
@@ -70,6 +75,7 @@ export async function loadSettings(): Promise<Settings> {
   const model = s[KEYS.model] as string | undefined;
   return {
     apiKey: (s[KEYS.apiKey] as string | undefined) ?? null,
+    baseUrl: (s[KEYS.baseUrl] as string | undefined) || null,
     systemPrompt: (s[KEYS.systemPrompt] as string | undefined) ?? "",
     blockedSites: (s[KEYS.blockedSites] as string[] | undefined) ?? [...DEFAULT_BLOCKED_SITES],
     // Fall back if a stored model is no longer offered.
@@ -79,11 +85,31 @@ export async function loadSettings(): Promise<Settings> {
   };
 }
 
-export async function saveSetting<K extends "apiKey" | "systemPrompt" | "blockedSites" | "model" | "autoRebuild" | "rebuildIntervalHours">(
+export async function saveSetting<K extends "apiKey" | "baseUrl" | "systemPrompt" | "blockedSites" | "model" | "autoRebuild" | "rebuildIntervalHours">(
   key: K,
   value: Settings[K],
 ): Promise<void> {
   await browser.storage.local.set({ [KEYS[key]]: value });
+}
+
+/** The gateway baked in at build time (WXT_ANTHROPIC_BASE_URL), used as the form default. */
+export const DEFAULT_BASE_URL: string = import.meta.env.WXT_ANTHROPIC_BASE_URL ?? "";
+
+/**
+ * Reduce what the user typed to the origin the SDK expects: "" → null, and a
+ * trailing "/" or "/v1" is dropped since the SDK appends "/v1/messages" itself.
+ * Returns undefined when the text isn't an http(s) URL.
+ */
+export function normalizeBaseUrl(raw: string): string | null | undefined {
+  const text = raw.trim();
+  if (!text) return null;
+  try {
+    const url = new URL(text);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return undefined;
+    return `${url.origin}${url.pathname}`.replace(/\/+$/, "").replace(/\/v1$/, "");
+  } catch {
+    return undefined;
+  }
 }
 
 export async function loadHomepage(): Promise<Homepage | undefined> {
