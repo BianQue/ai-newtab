@@ -6,12 +6,14 @@
     "build": "pnpm --filter @homepage/extension build",
     "dev": "pnpm --filter @homepage/extension dev",
     "typecheck": "pnpm -r typecheck",
-    "test": "bun test harness/",
+    "test": "bun test harness/ apps/ma-emulator/",
     "agent:run": "bun harness/run-agent.ts",
     "agent:verify": "bun harness/verify-homepage.ts",
     "agent:resume-test": "bun harness/test-resume.ts crash && bun harness/test-resume.ts resume",
     "agent:retention": "bun harness/check-retention.ts",
-    "extension:test": "bun harness/test-extension.ts"
+    "extension:test": "bun harness/test-extension.ts",
+    "emulator": "bun apps/ma-emulator/src/server.ts",
+    "emulator:e2e": "bun apps/ma-emulator/scripts/extension-e2e.ts"
   },
   "devDependencies": {
     "typescript": "^5.8.3"

@@ -1,0 +1,2 @@
+# Emulator state: sqlite db, uploaded file blobs, per-session sandboxes
+.data/

@@ -1,0 +1,19 @@
+{
+  "name": "@homepage/ma-emulator",
+  "private": true,
+  "type": "module",
+  "description": "A local, durable emulator of the Managed Agents API (agents, environments, sessions, events, resources, files) that runs the agent loop on any /v1/messages upstream.",
+  "scripts": {
+    "start": "bun src/server.ts",
+    "test": "bun test test/",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0"
+  },
+  "devDependencies": {
+    "@homepage/agent-core": "workspace:*",
+    "@types/bun": "^1.3.14",
+    "typescript": "^5.8.3"
+  }
+}
