@@ -19,3 +19,6 @@ harness/out/
 .claude/settings.local.json
 .DS_Store
 *.log
+
+# Personal learning workspace
+learn/
