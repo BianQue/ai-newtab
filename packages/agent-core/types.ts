@@ -26,11 +26,16 @@ export interface GetHistoryResult {
   sites: SiteDigest[];
 }
 
-/** A page whose HTML now lives in the host-side workspace rather than in context. */
+/** A page whose HTML now lives in the session sandbox rather than in context. */
 export interface PageRef {
   url: string;
   title: string;
-  /** Where the page is stored in the workspace; the model greps/reads this path verbatim. */
+  /**
+   * The path the sandbox actually resolved, read back off the `resources.add()`
+   * response. Never the path we asked for — the API re-roots every file resource
+   * under `/mnt/session/uploads/`, so a requested `/workspace/x.html` lands at
+   * `/mnt/session/uploads/workspace/x.html`.
+   */
   mountPath: string;
   /** Lets the model choose grep-first over read-whole. */
   bytes: number;
@@ -64,7 +69,7 @@ export interface ScrapedPage {
 
 /**
  * The two capabilities only a real browser has. Everything else the agent needs
- * (a filesystem, grep, read) is supplied by the in-memory Workspace.
+ * (a filesystem, grep, read) is supplied by the session sandbox.
  */
 export interface BrowserBridge {
   getHistory(args: {

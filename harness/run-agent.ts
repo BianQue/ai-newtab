@@ -1,11 +1,10 @@
 /**
- * End-to-end build against the real API (needs ANTHROPIC_API_KEY in .env;
- * ANTHROPIC_BASE_URL, if set, points the SDK at a gateway).
+ * End-to-end build against the real API (needs ANTHROPIC_API_KEY in .env).
  *
  * Exercises the exact orchestrator the extension runs, with a fixture/fetch
- * bridge standing in for chrome.history and chrome.tabs. Verifies: the
- * Messages API tool loop, tool dispatch, page storage in the workspace,
- * workspace grep/read, the written deliverable, and cleanup.
+ * bridge standing in for chrome.history and chrome.tabs. Verifies: agent +
+ * environment reuse, session lifecycle, custom-tool dispatch, mid-session file
+ * mounting, sandbox grep/read, the written deliverable, and cleanup.
  *
  * Run: pnpm agent:run
  */
