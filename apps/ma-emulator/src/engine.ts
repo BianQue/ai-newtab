@@ -93,6 +93,8 @@ interface Runner {
   driving: boolean;
   again: boolean;
   abort: AbortController | null;
+  /** The model call in flight: which upstream it went to, and how to cancel just that attempt. */
+  attempt: { upstream: string; cancel: () => void } | null;
 }
 
 const STATUS_EVENTS: Record<string, SessionStatus> = {
@@ -113,6 +115,8 @@ export class SessionEngine {
   private readonly listeners = new Map<string, Set<StreamListener>>();
   /** Upstream keys, in memory only. Never written to disk. */
   private readonly keys = new Map<string, string>();
+  /** The upstream a session's client asked to use first (`x-ma-upstream`); absent = configured order. */
+  private readonly preferred = new Map<string, string>();
   private readonly runners = new Map<string, Runner>();
   private stopping = false;
 
@@ -239,6 +243,7 @@ export class SessionEngine {
     this.sandbox(id).destroy();
     this.store.delete("sessions", id);
     this.keys.delete(id);
+    this.preferred.delete(id);
     this.runners.delete(id);
     this.log(`[session ${id}] deleted`);
     return { id, type: "session_deleted" };
@@ -371,6 +376,24 @@ export class SessionEngine {
     }
   }
 
+  /**
+   * The client's manual upstream choice for a session: an upstream name, or
+   * "auto" for the configured order. Applies from the session's next model
+   * call. Unknown names are ignored, so a stale setting can't break a build.
+   */
+  setPreferredUpstream(sessionId: string, name: string) {
+    if (!this.store.get<SessionDoc>("sessions", sessionId)) return;
+    const next = name === "auto" || !this.upstreams.has(name) ? undefined : name;
+    if (this.preferred.get(sessionId) === next) return;
+    if (next) this.preferred.set(sessionId, next);
+    else this.preferred.delete(sessionId);
+    this.log(`[session ${sessionId}] upstream preference: ${next ?? "auto"}${name !== "auto" && !next ? ` (unknown "${name}")` : ""}`);
+    // A manual switch away from the upstream a call is waiting on takes effect
+    // now: that attempt is dropped and resent (not counted as a failure).
+    const attempt = this.runners.get(sessionId)?.attempt;
+    if (next && attempt && attempt.upstream !== next) attempt.cancel();
+  }
+
   /** On startup: sessions that were mid-run when the emulator died carry on from their logs. */
   recover() {
     for (const s of this.store.list<SessionDoc>("sessions")) {
@@ -431,7 +454,7 @@ export class SessionEngine {
   private kick(sessionId: string) {
     if (this.stopping) return;
     let runner = this.runners.get(sessionId);
-    if (!runner) this.runners.set(sessionId, (runner = { driving: false, again: false, abort: null }));
+    if (!runner) this.runners.set(sessionId, (runner = { driving: false, again: false, abort: null, attempt: null }));
     if (runner.driving) {
       runner.again = true;
       return;
@@ -494,7 +517,7 @@ export class SessionEngine {
       }
 
       const clientKey = this.keys.get(sessionId);
-      if (this.upstreams.candidates(session.agent.model.id, clientKey).length === 0) {
+      if (this.upstreams.candidates(session.agent.model.id, clientKey, this.preferred.get(sessionId)).length === 0) {
         if (session.status !== "rescheduling") {
           this.append(sessionId, [{ body: event("session.status_rescheduled") }]);
         }
@@ -574,7 +597,8 @@ export class SessionEngine {
     const tried = new Set<string>();
     try {
       for (let attempt = 0; ; attempt++) {
-        const targets = this.upstreams.candidates(agent.model.id, clientKey);
+        // Re-read each attempt: a preference the client changes mid-build applies to the next try.
+        const targets = this.upstreams.candidates(agent.model.id, clientKey, this.preferred.get(sessionId));
         if (targets.length === 0) return "continue"; // no usable key; drive() parks the session
         const target = targets.find((t) => !tried.has(t.name)) ?? targets[0];
         tried.add(target.name);
@@ -582,8 +606,18 @@ export class SessionEngine {
         const start = event("span.model_request_start");
         this.append(sessionId, [{ body: start }]);
         let stalled = false;
+        let switched = false;
+        const attemptCtl = new AbortController();
+        runner.attempt = {
+          upstream: target.name,
+          cancel: () => {
+            switched = true;
+            attemptCtl.abort(new Error("switched upstream"));
+          },
+        };
         try {
-          const msg = await this.streamOnce(target, params, controller.signal, () => (stalled = true));
+          const signal = AbortSignal.any([controller.signal, attemptCtl.signal]);
+          const msg = await this.streamOnce(target, params, signal, () => (stalled = true));
           this.upstreams.markOk(target.name);
           this.recordResponse(sessionId, start.id, msg, customNames, target);
           return "continue";
@@ -596,6 +630,12 @@ export class SessionEngine {
           });
           this.append(sessionId, [{ body: endError }]);
           if (controller.signal.aborted) return "continue"; // interrupt: drive() re-derives and goes idle
+          if (switched) {
+            this.log(`[session ${sessionId}] model request via ${target.name} dropped: client switched upstream`);
+            tried.clear(); // the chosen upstream leads the candidates; go straight to it
+            attempt--; // a manual switch isn't a failed attempt
+            continue;
+          }
 
           this.upstreams.markFailed(target.name);
 
@@ -612,7 +652,9 @@ export class SessionEngine {
           // An error one gateway returns (bad key, unknown model, its own outage
           // reported as a 4xx) may not happen on another, so even a non-retryable
           // failure moves on to an upstream this request hasn't tried yet.
-          const untried = this.upstreams.candidates(agent.model.id, clientKey).find((t) => !tried.has(t.name));
+          const untried = this.upstreams
+            .candidates(agent.model.id, clientKey, this.preferred.get(sessionId))
+            .find((t) => !tried.has(t.name));
           this.log(
             `[session ${sessionId}] model request via ${target.name} failed ` +
               `(${stalled ? "stalled" : (status ?? "network")}): ${reason.slice(0, 300)}` +
@@ -646,6 +688,7 @@ export class SessionEngine {
       }
     } finally {
       runner.abort = null;
+      runner.attempt = null;
     }
   }
 

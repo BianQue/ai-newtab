@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { MODEL_CHOICES, normalizeBlockList, type HomepageModel } from "@homepage/agent-core";
 import { REBUILD_INTERVAL_CHOICES } from "@/lib/auto-rebuild";
+import { fetchUpstreams, type UpstreamInfo } from "@/lib/storage";
 import { btn } from "./ui";
 
 export function SettingsModal({
@@ -8,6 +9,9 @@ export function SettingsModal({
   blockedSites,
   model,
   onChangeModel,
+  gatewayUrl,
+  upstream,
+  onChangeUpstream,
   autoRebuild,
   onToggleAutoRebuild,
   intervalHours,
@@ -20,6 +24,10 @@ export function SettingsModal({
   blockedSites: string[];
   model: HomepageModel;
   onChangeModel: (next: HomepageModel) => void;
+  /** The endpoint builds talk to; asked for its upstream list if it's the local emulator. */
+  gatewayUrl: string | undefined;
+  upstream: string | null;
+  onChangeUpstream: (next: string) => void;
   autoRebuild: boolean;
   onToggleAutoRebuild: (next: boolean) => void;
   intervalHours: number;
@@ -30,6 +38,15 @@ export function SettingsModal({
 }) {
   const [draft, setDraft] = useState(initialPrompt);
   const [blockedDraft, setBlockedDraft] = useState(blockedSites.join("\n"));
+  const [upstreams, setUpstreams] = useState<UpstreamInfo[]>([]);
+  useEffect(() => {
+    let live = true;
+    fetchUpstreams(gatewayUrl).then((list) => live && setUpstreams(list));
+    return () => {
+      live = false;
+    };
+  }, [gatewayUrl]);
+  const mappedModel = (u: UpstreamInfo) => u.modelMap[model] ?? u.modelMap["*"];
 
   return (
     <div
@@ -89,6 +106,33 @@ export function SettingsModal({
             ))}
           </select>
         </label>
+        {upstreams.length > 1 && (
+          <>
+            <label
+              style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 16, color: "#333", fontSize: 14 }}
+            >
+              Upstream gateway
+              <select
+                value={upstream && upstreams.some((u) => u.name === upstream) ? upstream : "auto"}
+                onChange={(e) => onChangeUpstream(e.target.value)}
+                style={{ padding: "4px 8px", fontSize: 14, borderRadius: 4, border: "1px solid #ddd", maxWidth: 420 }}
+              >
+                <option value="auto">Auto (primary first, switch on failure)</option>
+                {upstreams.map((u) => (
+                  <option key={u.name} value={u.name}>
+                    {u.name} · {hostOf(u.baseUrl)}
+                    {mappedModel(u) ? ` · ${mappedModel(u)}` : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <p style={{ color: "#888", fontSize: 12, margin: "6px 0 0" }}>
+              Chosen by the local emulator. The one you pick is tried first; if it fails or stalls the
+              build still switches to another. Applies from the next model call, including a build in
+              progress.
+            </p>
+          </>
+        )}
         <label
           style={{
             display: "flex",
@@ -156,4 +200,12 @@ export function SettingsModal({
       </div>
     </div>
   );
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
 }

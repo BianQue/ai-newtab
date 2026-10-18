@@ -49,20 +49,27 @@ export class UpstreamPool {
     return this.specs.some((s) => s.apiKey);
   }
 
+  has(name: string): boolean {
+    return this.specs.some((s) => s.name === name);
+  }
+
   /**
-   * The upstreams to try for `model`, best first: those not cooling down in
-   * configured order, then the cooling ones (soonest back first) — a request is
-   * never refused just because everything failed recently. Upstreams with no
-   * usable key are left out.
+   * The upstreams to try for `model`, best first: the client's `preferred` one
+   * (a manual choice, so it leads even while cooling down), then those not
+   * cooling down in configured order, then the cooling ones (soonest back
+   * first) — a request is never refused just because everything failed
+   * recently. Upstreams with no usable key are left out.
    */
-  candidates(model: string, clientKey: string | undefined): UpstreamTarget[] {
+  candidates(model: string, clientKey: string | undefined, preferred?: string): UpstreamTarget[] {
     const t = this.now();
     const usable = this.specs
       .map((spec, order) => ({ spec, order, key: spec.apiKey ?? clientKey, until: this.downUntil.get(spec.name) ?? 0 }))
       .filter((u) => u.key);
-    const up = usable.filter((u) => u.until <= t);
-    const down = usable.filter((u) => u.until > t).sort((a, b) => a.until - b.until);
-    return [...up, ...down].map(({ spec, key }) => ({
+    const pinned = usable.filter((u) => u.spec.name === preferred);
+    const rest = usable.filter((u) => u.spec.name !== preferred);
+    const up = rest.filter((u) => u.until <= t);
+    const down = rest.filter((u) => u.until > t).sort((a, b) => a.until - b.until);
+    return [...pinned, ...up, ...down].map(({ spec, key }) => ({
       name: spec.name,
       client: this.factory(spec, key!),
       model: mapModel(spec.modelMap, model),

@@ -15,6 +15,8 @@ interface Ctx {
   url: URL;
   params: string[];
   apiKey?: string;
+  /** `x-ma-upstream`: the upstream the client wants tried first, or "auto". Emulator-only. */
+  upstream?: string;
 }
 
 type Handler = (ctx: Ctx) => Response | Promise<Response>;
@@ -61,7 +63,13 @@ export function createRouter(s: Services) {
     json({
       ok: true,
       upstream: primary.baseUrl,
-      upstreams: s.config.upstreams.map((u) => ({ name: u.name, baseUrl: u.baseUrl, fixedKey: Boolean(u.apiKey) })),
+      // The extension's Settings lists these to offer a manual choice (sent back as x-ma-upstream).
+      upstreams: s.config.upstreams.map((u) => ({
+        name: u.name,
+        baseUrl: u.baseUrl,
+        fixedKey: Boolean(u.apiKey),
+        modelMap: u.modelMap,
+      })),
       fixedKey: anyFixedKey,
     }),
   );
@@ -87,8 +95,9 @@ export function createRouter(s: Services) {
   on("POST", "/v1/agents/:id/archive", ({ params }) => json(registry.archiveAgent(params[0])));
 
   // ---- sessions ----------------------------------------------------------------------
-  on("POST", "/v1/sessions", async ({ req, apiKey }) => {
+  on("POST", "/v1/sessions", async ({ req, apiKey, upstream }) => {
     const doc = engine.createSession(await readJson(req), apiKey);
+    if (upstream) engine.setPreferredUpstream(doc.id, upstream);
     return json(engine.view(doc));
   });
   on("GET", "/v1/sessions", () =>
@@ -247,7 +256,12 @@ export function createRouter(s: Services) {
           : new ApiError(404, "not_found_error", `No route for ${req.method} ${url.pathname}`);
       }
       const params = url.pathname.match(match[1])!.slice(1).map(decodeURIComponent);
-      res = await match[2]({ req, url, params, apiKey });
+      // Any request on a session carries the client's current upstream choice;
+      // set it before the handler, so events sent now already use it.
+      const upstream = req.headers.get("x-ma-upstream")?.trim() || undefined;
+      const sessionPath = url.pathname.match(/^\/v1\/sessions\/(sesn_[^/]+)/);
+      if (upstream && sessionPath) engine.setPreferredUpstream(decodeURIComponent(sessionPath[1]), upstream);
+      res = await match[2]({ req, url, params, apiKey, upstream });
     } catch (err) {
       if (err instanceof ApiError) res = err.toResponse();
       else {

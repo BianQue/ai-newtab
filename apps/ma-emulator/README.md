@@ -80,6 +80,15 @@ MA_UPSTREAM_2_MODEL_MAP=claude-sonnet-5-5=glm-5.3-flash,claude-opus-5-5=kimi-k3,
 Failover applies to sessions. The `/v1/messages` passthrough always goes to the
 primary.
 
+**Choosing an upstream by hand.** A client can send `x-ma-upstream: <name>`
+(`primary`, `fallback-2`, …) or `auto` on any session request. The named
+upstream is then tried first for that session, and failover still applies
+after it. The choice holds until the client sends a different one. If a model
+call is waiting on another upstream when the choice arrives, it is dropped and
+resent at once. `/health` lists the upstreams and their model maps. The
+extension's Settings uses that list for its **Upstream gateway** menu, which
+only appears when the emulator has more than one upstream.
+
 ## Semantics it reproduces
 
 - **The session runs without the client.** The loop lives here; a client that

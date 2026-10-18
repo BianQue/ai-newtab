@@ -1,5 +1,6 @@
 import { BuildManager } from "@/lib/build-manager";
 import { AGENT_PORT } from "@/lib/protocol";
+import { KEYS } from "@/lib/storage";
 
 /**
  * The service worker is the build host. It owns the agent loop (BuildManager),
@@ -25,6 +26,10 @@ export default defineBackground(() => {
   browser.alarms.create(HEARTBEAT_ALARM, { periodInMinutes: 1 });
   browser.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === HEARTBEAT_ALARM) void manager.tick();
+  });
+
+  browser.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && KEYS.upstream in changes) void manager.announceUpstreamChoice();
   });
 
   browser.runtime.onStartup.addListener(() => void manager.tick());

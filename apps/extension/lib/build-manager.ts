@@ -10,7 +10,15 @@ import {
   type BuildState,
   type PageMsg,
 } from "./protocol";
-import { KEYS, extensionStore, loadHomepage, loadSettings, saveHomepage } from "./storage";
+import {
+  KEYS,
+  effectiveBaseUrl,
+  extensionStore,
+  fetchWithUpstreamChoice,
+  loadHomepage,
+  loadSettings,
+  saveHomepage,
+} from "./storage";
 
 type Port = Parameters<Parameters<typeof browser.runtime.onConnect.addListener>[0]>[0];
 
@@ -39,6 +47,8 @@ export class BuildManager {
   private state: BuildState = { ...INITIAL_BUILD_STATE };
   private readonly ports = new Set<Port>();
   private controller: AbortController | null = null;
+  /** The running build's API client (null between builds). */
+  private client: Anthropic | null = null;
   private running = false;
   private keepalive: ReturnType<typeof setInterval> | null = null;
   private lastSnapshotAt = 0;
@@ -163,8 +173,9 @@ export class BuildManager {
       // The key is the user's own, read from local storage — there is no server
       // to hide it behind. See ARCHITECTURE.md → Privacy.
       // Optional third-party gateway: the one saved in the UI, else the build-time default.
-      const baseURL = baseUrl || import.meta.env.WXT_ANTHROPIC_BASE_URL || undefined;
-      const client = new Anthropic({ apiKey, baseURL, dangerouslyAllowBrowser: true });
+      const baseURL = effectiveBaseUrl(baseUrl);
+      const client = new Anthropic({ apiKey, baseURL, dangerouslyAllowBrowser: true, fetch: fetchWithUpstreamChoice });
+      this.client = client;
 
       const resumeSessionId = opts.resume
         ? await extensionStore.get<string>(KEYS.activeSessionId)
@@ -203,12 +214,28 @@ export class BuildManager {
     } finally {
       this.running = false;
       this.controller = null;
+      this.client = null;
       this.stopKeepalive();
     }
   }
 
   cancel() {
     this.controller?.abort();
+  }
+
+  /**
+   * The upstream choice changed in Settings. Every request already carries it,
+   * but mid-turn the build may make none for minutes (it only holds the event
+   * stream), so tell the emulator now with one cheap session read.
+   */
+  async announceUpstreamChoice() {
+    const sessionId = await extensionStore.get<string>(KEYS.activeSessionId);
+    if (!this.running || !this.client || !sessionId) return;
+    try {
+      await this.client.beta.sessions.retrieve(sessionId);
+    } catch (err) {
+      console.warn("[BuildManager] could not announce the upstream choice", err);
+    }
   }
 
   // ---- callback fan-out ----------------------------------------------------

@@ -99,6 +99,40 @@ test("a non-retryable error on one gateway still moves on to an untried one", as
   expect(evs.at(-1).stop_reason.type).toBe("end_turn");
 });
 
+test("x-ma-upstream: a manual choice leads, switches mid-session, and 'auto' restores the order", async () => {
+  const model = fakeModel([
+    () => reply([text("one")]),
+    () => reply([text("two")]),
+    () => reply([text("three")]),
+  ]);
+  h = startHarness(model, { upstreams: TWO });
+  const pinned = (name: string) => ({ headers: { "x-ma-upstream": name } });
+  const env = await h.client.beta.environments.create({ name: "e", config: { type: "cloud", networking: { type: "unrestricted" } } });
+  const agent = await h.client.beta.agents.create({ name: "t", model: "claude-test", system: "s", tools: [] } as any);
+  const session = await h.client.beta.sessions.create({ agent: agent.id, environment_id: env.id }, pinned("fallback-2"));
+  const say = async (t: string, opts?: object) => {
+    await h!.client.beta.sessions.events.send(session.id, { events: [{ type: "user.message", content: [{ type: "text", text: t }] }] }, opts);
+    await idle(h!, session.id);
+  };
+  await say("a"); // the choice made at creation sticks without the header
+  await say("b", pinned("auto"));
+  await say("c", pinned("no-such-upstream")); // unknown names are ignored (stays auto)
+  expect(model.upstreamsSeen).toEqual(["fallback-2", "primary", "primary"]);
+  expect(model.requests[0].model).toBe("glm-test");
+});
+
+test("switching upstream mid-call drops the hanging attempt at once, without an error", async () => {
+  const model = fakeModel([silent, () => reply([text("from backup")])]);
+  h = startHarness(model, { upstreams: TWO }); // stall timeout 60s: only the switch can rescue this
+  const id = await run(h);
+  await waitFor(() => model.upstreamsSeen.length === 1, "primary call in flight");
+  await h.client.beta.sessions.retrieve(id, {}, { headers: { "x-ma-upstream": "fallback-2" } });
+  const evs = await idle(h, id);
+  expect(model.upstreamsSeen).toEqual(["primary", "fallback-2"]);
+  expect(evs.filter((e) => e.type === "session.error")).toEqual([]);
+  expect(evs.at(-1).stop_reason.type).toBe("end_turn");
+});
+
 test("pool ordering, cooldown expiry and keyless upstreams", () => {
   let now = 0;
   const pool = new UpstreamPool(TWO, (spec) => spec.name as any, 1000, () => now);
@@ -107,6 +141,7 @@ test("pool ordering, cooldown expiry and keyless upstreams", () => {
   expect(names(undefined)).toEqual(["fallback-2"]); // primary forwards the client's key; none here
   pool.markFailed("primary");
   expect(names("k")).toEqual(["fallback-2", "primary"]); // cooling, but still last resort
+  expect(pool.candidates("claude-test", "k", "primary").map((t) => t.name)).toEqual(["primary", "fallback-2"]); // pinned beats cooldown
   now = 1001;
   expect(names("k")).toEqual(["primary", "fallback-2"]);
 });

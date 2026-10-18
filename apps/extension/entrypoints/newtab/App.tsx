@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { DEFAULT_MODEL, DEFAULT_BLOCKED_SITES, type HomepageModel } from "@homepage/agent-core";
 import { DEFAULT_REBUILD_INTERVAL_HOURS } from "@/lib/auto-rebuild";
 import { BUILD_STEPS } from "@/lib/protocol";
-import { KEYS, extensionStore, loadHomepage, loadSettings, saveSetting } from "@/lib/storage";
+import { KEYS, effectiveBaseUrl, extensionStore, loadHomepage, loadSettings, saveSetting } from "@/lib/storage";
 import { toRenderable } from "@/lib/transpile";
 import { ApiKeySetup } from "./components/ApiKeySetup";
 import { BuildProgress } from "./components/BuildProgress";
@@ -15,6 +15,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [apiKey, setApiKey] = useState<string | null>(null);
   const [baseUrl, setBaseUrl] = useState<string | null>(null);
+  const [upstream, setUpstream] = useState<string | null>(null);
   const [systemPrompt, setSystemPrompt] = useState("");
   const [blockedSites, setBlockedSites] = useState<string[]>(DEFAULT_BLOCKED_SITES);
   const [model, setModel] = useState<HomepageModel>(DEFAULT_MODEL);
@@ -49,6 +50,7 @@ export default function App() {
         ]);
         setApiKey(settings.apiKey);
         setBaseUrl(settings.baseUrl);
+        setUpstream(settings.upstream);
         setSystemPrompt(settings.systemPrompt);
         setBlockedSites(settings.blockedSites);
         setModel(settings.model);
@@ -62,11 +64,21 @@ export default function App() {
     })();
   }, []);
 
-  const saveKey = useCallback(async (key: string, nextBaseUrl: string | null) => {
-    await Promise.all([saveSetting("apiKey", key), saveSetting("baseUrl", nextBaseUrl)]);
-    setBaseUrl(nextBaseUrl);
-    setApiKey(key);
-  }, []);
+  const saveKey = useCallback(
+    async (key: string, nextBaseUrl: string | null) => {
+      // An upstream choice names one of the old endpoint's gateways; it means nothing elsewhere.
+      const gatewayChanged = nextBaseUrl !== baseUrl;
+      await Promise.all([
+        saveSetting("apiKey", key),
+        saveSetting("baseUrl", nextBaseUrl),
+        ...(gatewayChanged ? [saveSetting("upstream", null)] : []),
+      ]);
+      if (gatewayChanged) setUpstream(null);
+      setBaseUrl(nextBaseUrl);
+      setApiKey(key);
+    },
+    [baseUrl],
+  );
 
   /** Back to the key screen, prefilled with the current gateway. */
   const changeKey = useCallback(async () => {
@@ -91,6 +103,11 @@ export default function App() {
   const changeModel = useCallback(async (next: HomepageModel) => {
     setModel(next);
     await saveSetting("model", next);
+  }, []);
+  // Read by every request the worker's client makes, so a running build picks it up too.
+  const changeUpstream = useCallback(async (next: string) => {
+    setUpstream(next);
+    await saveSetting("upstream", next);
   }, []);
   const toggleAutoRebuild = useCallback(async (next: boolean) => {
     setAutoRebuild(next);
@@ -227,6 +244,9 @@ export default function App() {
           blockedSites={blockedSites}
           model={model}
           onChangeModel={changeModel}
+          gatewayUrl={effectiveBaseUrl(baseUrl)}
+          upstream={upstream}
+          onChangeUpstream={changeUpstream}
           autoRebuild={autoRebuild}
           onToggleAutoRebuild={toggleAutoRebuild}
           intervalHours={intervalHours}
