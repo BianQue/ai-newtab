@@ -72,7 +72,11 @@ if (import.meta.main) {
   const emu = startEmulator(config);
   console.log(`Managed Agents emulator listening on ${emu.url}`);
   for (const u of config.upstreams) {
-    const key = u.apiKey ? "fixed key" : "client's key (in memory only)";
+    const key = u.apiKey
+      ? "fixed key"
+      : u.name === "primary"
+        ? "client's key (in memory only)"
+        : `client's key via x-ma-key-${u.name} (in memory only)`;
     const map = Object.entries(u.modelMap).map(([from, to]) => `${from}→${to}`).join(", ");
     console.log(`  upstream ${u.name.padEnd(11)} ${u.baseUrl}  [${key}]${map ? `  models: ${map}` : ""}`);
   }

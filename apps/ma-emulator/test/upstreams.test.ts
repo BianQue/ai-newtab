@@ -133,15 +133,38 @@ test("switching upstream mid-call drops the hanging attempt at once, without an 
   expect(evs.at(-1).stop_reason.type).toBe("end_turn");
 });
 
+test("a fallback without a fixed key uses the key the client sends for it, and only that one", async () => {
+  const keyless = TWO.map(({ apiKey: _, ...u }) => u);
+  const model = fakeModel([silent, () => reply([text("from backup")]), () => reply([text("primary only")])]);
+  h = startHarness(model, { upstreams: keyless, stallTimeoutMs: 100 });
+  const env = await h.client.beta.environments.create({ name: "e", config: { type: "cloud", networking: { type: "unrestricted" } } });
+  const agent = await h.client.beta.agents.create({ name: "t", model: "claude-test", system: "s", tools: [] } as any);
+  const withKey = { headers: { "x-ma-key-fallback-2": "sk-client-backup" } };
+  const session = await h.client.beta.sessions.create({ agent: agent.id, environment_id: env.id }, withKey);
+  const say = async (t: string, opts?: object) => {
+    await h!.client.beta.sessions.events.send(session.id, { events: [{ type: "user.message", content: [{ type: "text", text: t }] }] }, opts);
+    return idle(h!, session.id);
+  };
+  await say("a", withKey);
+  expect(model.upstreamsSeen).toEqual(["primary", "fallback-2"]);
+  expect(model.keysSeen).toEqual(["sk-test-key", "sk-client-backup"]);
+
+  // An empty header forgets the key: the fallback drops out, even though the
+  // primary is still cooling down from its stall.
+  await say("b", { headers: { "x-ma-key-fallback-2": "" } });
+  expect(model.upstreamsSeen.at(-1)).toBe("primary");
+  expect(model.keysSeen.at(-1)).toBe("sk-test-key");
+});
+
 test("pool ordering, cooldown expiry and keyless upstreams", () => {
   let now = 0;
   const pool = new UpstreamPool(TWO, (spec) => spec.name as any, 1000, () => now);
-  const names = (key?: string) => pool.candidates("claude-test", key).map((t) => t.name);
+  const names = (key?: string) => pool.candidates("claude-test", key ? { primary: key } : {}).map((t) => t.name);
   expect(names("k")).toEqual(["primary", "fallback-2"]);
   expect(names(undefined)).toEqual(["fallback-2"]); // primary forwards the client's key; none here
   pool.markFailed("primary");
   expect(names("k")).toEqual(["fallback-2", "primary"]); // cooling, but still last resort
-  expect(pool.candidates("claude-test", "k", "primary").map((t) => t.name)).toEqual(["primary", "fallback-2"]); // pinned beats cooldown
+  expect(pool.candidates("claude-test", { primary: "k" }, "primary").map((t) => t.name)).toEqual(["primary", "fallback-2"]); // pinned beats cooldown
   now = 1001;
   expect(names("k")).toEqual(["primary", "fallback-2"]);
 });
@@ -159,6 +182,7 @@ test("config: numbered fallbacks with model maps", () => {
     ["fallback-2", "https://b.example", "sk-b"],
   ]);
   expect(c.upstreams[1].modelMap).toEqual({ "claude-sonnet-5-5": "glm-5.3-flash", "claude-opus-5-5": "kimi-k3" });
-  expect(() => loadConfig({ MA_UPSTREAM_2_BASE_URL: "https://b.example" })).toThrow("MA_UPSTREAM_2_API_KEY");
+  // No key: the client supplies it per request (x-ma-key-fallback-2).
+  expect(loadConfig({ MA_UPSTREAM_2_BASE_URL: "https://b.example" }).upstreams[1].apiKey).toBeUndefined();
   expect(mapModel(parseModelMap("a=b"), "z")).toBe("z");
 });

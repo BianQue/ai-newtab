@@ -29,7 +29,9 @@ export default defineBackground(() => {
   });
 
   browser.storage.onChanged.addListener((changes, area) => {
-    if (area === "local" && KEYS.upstream in changes) void manager.announceUpstreamChoice();
+    if (area === "local" && (KEYS.upstream in changes || KEYS.upstreamKeys in changes)) {
+      void manager.announceUpstreamChoice();
+    }
   });
 
   browser.runtime.onStartup.addListener(() => void manager.tick());

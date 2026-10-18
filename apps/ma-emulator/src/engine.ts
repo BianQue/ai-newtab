@@ -7,7 +7,7 @@ import type { AgentDoc, Registry } from "./registry";
 import { OUTPUT_ROOT, Sandbox, UPLOAD_ROOT } from "./sandbox";
 import type { NewEvent, StoredEvent, Store } from "./store";
 import { ALL_TOOLSET_NAMES, BUILTIN_TOOL_DEFS, SUPPORTED_BUILTINS, runBuiltinTool, type BuiltinToolName } from "./toolset";
-import type { UpstreamPool, UpstreamTarget } from "./upstreams";
+import type { ClientKeys, UpstreamPool, UpstreamTarget } from "./upstreams";
 import { ApiError, badRequest, conflict, newId, notFound, nowIso, sleep } from "./util";
 
 /**
@@ -113,8 +113,12 @@ const event = (type: string, fields: Record<string, unknown> = {}) => ({
 
 export class SessionEngine {
   private readonly listeners = new Map<string, Set<StreamListener>>();
-  /** Upstream keys, in memory only. Never written to disk. */
-  private readonly keys = new Map<string, string>();
+  /**
+   * The keys each session's client sent, by upstream name. In memory only,
+   * never written to disk. Each request updates the keys it carries (an empty
+   * one forgets that upstream's key) and leaves the rest alone.
+   */
+  private readonly keys = new Map<string, ClientKeys>();
   /** The upstream a session's client asked to use first (`x-ma-upstream`); absent = configured order. */
   private readonly preferred = new Map<string, string>();
   private readonly runners = new Map<string, Runner>();
@@ -133,7 +137,7 @@ export class SessionEngine {
   // sessions
   // ---------------------------------------------------------------------------
 
-  createSession(body: any, apiKey?: string): SessionDoc {
+  createSession(body: any, keys: ClientKeys = {}): SessionDoc {
     const agentRef = body?.agent;
     let agent: AgentDoc;
     if (typeof agentRef === "string") agent = this.registry.getAgent(agentRef);
@@ -174,7 +178,7 @@ export class SessionEngine {
     };
     this.store.put("sessions", doc);
     mkdirSync(this.sandbox(doc.id).root, { recursive: true });
-    if (apiKey) this.keys.set(doc.id, apiKey);
+    this.mergeKeys(doc.id, keys);
 
     for (const resource of body.resources ?? []) this.addResource(doc.id, resource);
     this.log(`[session ${doc.id}] created (agent ${agent.id} v${agent.version})`);
@@ -316,9 +320,9 @@ export class SessionEngine {
     return () => set!.delete(listener);
   }
 
-  sendEvents(sessionId: string, events: any[], apiKey?: string) {
+  sendEvents(sessionId: string, events: any[], keys: ClientKeys = {}) {
     const session = this.getSession(sessionId);
-    if (apiKey) this.keys.set(sessionId, apiKey);
+    this.mergeKeys(sessionId, keys);
     if (session.status === "terminated") throw badRequest(`Session ${sessionId} is terminated`);
     if (session.archived_at) throw badRequest(`Session ${sessionId} is archived`);
     if (!Array.isArray(events) || events.length === 0) throw badRequest("events must be a non-empty array");
@@ -367,9 +371,9 @@ export class SessionEngine {
   }
 
   /** Any authenticated request on a session refreshes its key; a session stalled for want of one resumes. */
-  rememberKey(sessionId: string, apiKey: string | undefined) {
-    if (!apiKey || !this.store.get<SessionDoc>("sessions", sessionId)) return;
-    this.keys.set(sessionId, apiKey);
+  rememberKey(sessionId: string, keys: ClientKeys = {}) {
+    if (Object.keys(keys).length === 0 || !this.store.get<SessionDoc>("sessions", sessionId)) return;
+    this.mergeKeys(sessionId, keys);
     if (this.getSession(sessionId).status === "rescheduling" && !this.runners.get(sessionId)?.driving) {
       this.log(`[session ${sessionId}] key supplied, resuming`);
       this.kick(sessionId);
@@ -392,6 +396,21 @@ export class SessionEngine {
     // now: that attempt is dropped and resent (not counted as a failure).
     const attempt = this.runners.get(sessionId)?.attempt;
     if (next && attempt && attempt.upstream !== next) attempt.cancel();
+  }
+
+  private mergeKeys(sessionId: string, keys: ClientKeys) {
+    if (Object.keys(keys).length === 0) return;
+    const merged = { ...this.keys.get(sessionId) };
+    for (const [name, key] of Object.entries(keys)) {
+      if (key) merged[name] = key;
+      else delete merged[name];
+    }
+    this.keys.set(sessionId, merged);
+  }
+
+  /** Re-read on every attempt: keys sent mid-build apply to the next model call. */
+  private clientKeys(sessionId: string): ClientKeys {
+    return this.keys.get(sessionId) ?? {};
   }
 
   /** On startup: sessions that were mid-run when the emulator died carry on from their logs. */
@@ -516,8 +535,7 @@ export class SessionEngine {
         return;
       }
 
-      const clientKey = this.keys.get(sessionId);
-      if (this.upstreams.candidates(session.agent.model.id, clientKey, this.preferred.get(sessionId)).length === 0) {
+      if (this.upstreams.candidates(session.agent.model.id, this.clientKeys(sessionId), this.preferred.get(sessionId)).length === 0) {
         if (session.status !== "rescheduling") {
           this.append(sessionId, [{ body: event("session.status_rescheduled") }]);
         }
@@ -547,7 +565,7 @@ export class SessionEngine {
         return;
       }
 
-      const outcome = await this.callModel(sessionId, session, d, clientKey, runner);
+      const outcome = await this.callModel(sessionId, session, d, runner);
       if (outcome === "stop") return;
     }
   }
@@ -575,7 +593,6 @@ export class SessionEngine {
     sessionId: string,
     session: SessionDoc,
     d: Derived,
-    clientKey: string | undefined,
     runner: Runner,
   ): Promise<"continue" | "stop"> {
     const agent = session.agent;
@@ -598,7 +615,7 @@ export class SessionEngine {
     try {
       for (let attempt = 0; ; attempt++) {
         // Re-read each attempt: a preference the client changes mid-build applies to the next try.
-        const targets = this.upstreams.candidates(agent.model.id, clientKey, this.preferred.get(sessionId));
+        const targets = this.upstreams.candidates(agent.model.id, this.clientKeys(sessionId), this.preferred.get(sessionId));
         if (targets.length === 0) return "continue"; // no usable key; drive() parks the session
         const target = targets.find((t) => !tried.has(t.name)) ?? targets[0];
         tried.add(target.name);
@@ -653,7 +670,7 @@ export class SessionEngine {
           // reported as a 4xx) may not happen on another, so even a non-retryable
           // failure moves on to an upstream this request hasn't tried yet.
           const untried = this.upstreams
-            .candidates(agent.model.id, clientKey, this.preferred.get(sessionId))
+            .candidates(agent.model.id, this.clientKeys(sessionId), this.preferred.get(sessionId))
             .find((t) => !tried.has(t.name));
           this.log(
             `[session ${sessionId}] model request via ${target.name} failed ` +

@@ -16,6 +16,7 @@ export default function App() {
   const [apiKey, setApiKey] = useState<string | null>(null);
   const [baseUrl, setBaseUrl] = useState<string | null>(null);
   const [upstream, setUpstream] = useState<string | null>(null);
+  const [upstreamKeys, setUpstreamKeys] = useState<Record<string, string>>({});
   const [systemPrompt, setSystemPrompt] = useState("");
   const [blockedSites, setBlockedSites] = useState<string[]>(DEFAULT_BLOCKED_SITES);
   const [model, setModel] = useState<HomepageModel>(DEFAULT_MODEL);
@@ -51,6 +52,7 @@ export default function App() {
         setApiKey(settings.apiKey);
         setBaseUrl(settings.baseUrl);
         setUpstream(settings.upstream);
+        setUpstreamKeys(settings.upstreamKeys);
         setSystemPrompt(settings.systemPrompt);
         setBlockedSites(settings.blockedSites);
         setModel(settings.model);
@@ -66,14 +68,18 @@ export default function App() {
 
   const saveKey = useCallback(
     async (key: string, nextBaseUrl: string | null) => {
-      // An upstream choice names one of the old endpoint's gateways; it means nothing elsewhere.
+      // An upstream choice (and a fallback key) names one of the old endpoint's
+      // gateways; it means nothing elsewhere, and a key mustn't follow it there.
       const gatewayChanged = nextBaseUrl !== baseUrl;
       await Promise.all([
         saveSetting("apiKey", key),
         saveSetting("baseUrl", nextBaseUrl),
-        ...(gatewayChanged ? [saveSetting("upstream", null)] : []),
+        ...(gatewayChanged ? [saveSetting("upstream", null), saveSetting("upstreamKeys", {})] : []),
       ]);
-      if (gatewayChanged) setUpstream(null);
+      if (gatewayChanged) {
+        setUpstream(null);
+        setUpstreamKeys({});
+      }
       setBaseUrl(nextBaseUrl);
       setApiKey(key);
     },
@@ -109,6 +115,15 @@ export default function App() {
     setUpstream(next);
     await saveSetting("upstream", next);
   }, []);
+  // A cleared key is stored as "" (not dropped) so the emulator is told to forget it.
+  const changeUpstreamKey = useCallback(
+    async (name: string, key: string) => {
+      const next = { ...upstreamKeys, [name]: key.trim() };
+      setUpstreamKeys(next);
+      await saveSetting("upstreamKeys", next);
+    },
+    [upstreamKeys],
+  );
   const toggleAutoRebuild = useCallback(async (next: boolean) => {
     setAutoRebuild(next);
     await saveSetting("autoRebuild", next);
@@ -247,6 +262,8 @@ export default function App() {
           gatewayUrl={effectiveBaseUrl(baseUrl)}
           upstream={upstream}
           onChangeUpstream={changeUpstream}
+          upstreamKeys={upstreamKeys}
+          onChangeUpstreamKey={changeUpstreamKey}
           autoRebuild={autoRebuild}
           onToggleAutoRebuild={toggleAutoRebuild}
           intervalHours={intervalHours}

@@ -224,7 +224,7 @@ export class BuildManager {
   }
 
   /**
-   * The upstream choice changed in Settings. Every request already carries it,
+   * The upstream choice or a fallback key changed in Settings. Every request already carries them,
    * but mid-turn the build may make none for minutes (it only holds the event
    * stream), so tell the emulator now with one cheap session read.
    */

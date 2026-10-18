@@ -12,7 +12,8 @@ export interface EmulatorConfig {
    * emulator holds no key of its own: it forwards whatever key the client sent,
    * keeps it in memory only, and a session orphaned by an emulator restart waits
    * until a client request supplies a key again (or a fallback with a fixed key
-   * picks it up). Fallbacks need their own key.
+   * picks it up). A fallback's key works the same way: fixed here, or sent by
+   * the client as `x-ma-key-<name>` (e.g. `x-ma-key-fallback-2`).
    */
   upstreams: UpstreamSpec[];
   maxTokens: number;
@@ -56,8 +57,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // Fallbacks: MA_UPSTREAM_2_BASE_URL / _API_KEY / _MODEL_MAP, then _3_, … up to the first gap.
   for (let n = 2; env[`MA_UPSTREAM_${n}_BASE_URL`]; n++) {
     const baseUrl = env[`MA_UPSTREAM_${n}_BASE_URL`]!;
-    const apiKey = env[`MA_UPSTREAM_${n}_API_KEY`];
-    if (!apiKey) throw new Error(`MA_UPSTREAM_${n}_BASE_URL is set but MA_UPSTREAM_${n}_API_KEY is not`);
+    const apiKey = env[`MA_UPSTREAM_${n}_API_KEY`] || undefined;
     if (pointsAtSelf(baseUrl, port)) throw new Error(`MA_UPSTREAM_${n}_BASE_URL (${baseUrl}) points at the emulator itself`);
     upstreams.push({
       name: `fallback-${n}`,

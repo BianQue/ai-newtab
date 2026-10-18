@@ -12,6 +12,8 @@ export function SettingsModal({
   gatewayUrl,
   upstream,
   onChangeUpstream,
+  upstreamKeys,
+  onChangeUpstreamKey,
   autoRebuild,
   onToggleAutoRebuild,
   intervalHours,
@@ -28,6 +30,9 @@ export function SettingsModal({
   gatewayUrl: string | undefined;
   upstream: string | null;
   onChangeUpstream: (next: string) => void;
+  /** Keys for fallback gateways the emulator doesn't hold one for, by upstream name. */
+  upstreamKeys: Record<string, string>;
+  onChangeUpstreamKey: (name: string, key: string) => void;
   autoRebuild: boolean;
   onToggleAutoRebuild: (next: boolean) => void;
   intervalHours: number;
@@ -47,6 +52,9 @@ export function SettingsModal({
     };
   }, [gatewayUrl]);
   const mappedModel = (u: UpstreamInfo) => u.modelMap[model] ?? u.modelMap["*"];
+  // The primary uses the API key from the key screen; fallbacks the emulator has no key for need one here.
+  const needsKey = upstreams.filter((u) => u.name !== "primary" && !u.fixedKey);
+  const missingKey = (u: UpstreamInfo) => needsKey.includes(u) && !upstreamKeys[u.name];
 
   return (
     <div
@@ -122,6 +130,7 @@ export function SettingsModal({
                   <option key={u.name} value={u.name}>
                     {u.name} · {hostOf(u.baseUrl)}
                     {mappedModel(u) ? ` · ${mappedModel(u)}` : ""}
+                    {missingKey(u) ? " (no key)" : ""}
                   </option>
                 ))}
               </select>
@@ -131,6 +140,21 @@ export function SettingsModal({
               build still switches to another. Applies from the next model call, including a build in
               progress.
             </p>
+            {needsKey.map((u) => (
+              <UpstreamKeyField
+                key={u.name}
+                name={u.name}
+                host={hostOf(u.baseUrl)}
+                value={upstreamKeys[u.name] ?? ""}
+                onSave={(key) => onChangeUpstreamKey(u.name, key)}
+              />
+            ))}
+            {needsKey.length > 0 && (
+              <p style={{ color: "#888", fontSize: 12, margin: "6px 0 0" }}>
+                Stored in this browser like your main API key and sent only to the local emulator,
+                which passes it on only to that gateway. Without one the gateway is skipped.
+              </p>
+            )}
           </>
         )}
         <label
@@ -199,6 +223,40 @@ export function SettingsModal({
         </div>
       </div>
     </div>
+  );
+}
+
+/** A fallback gateway's key: saved when the field loses focus or Enter is pressed. */
+function UpstreamKeyField({
+  name,
+  host,
+  value,
+  onSave,
+}: {
+  name: string;
+  host: string;
+  value: string;
+  onSave: (key: string) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+  const commit = () => draft.trim() !== value && onSave(draft);
+  return (
+    <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, color: "#333", fontSize: 14 }}>
+      <span style={{ whiteSpace: "nowrap" }}>
+        {name} key <span style={{ color: "#888" }}>({host})</span>
+      </span>
+      <input
+        type="password"
+        autoComplete="off"
+        value={draft}
+        placeholder="API key for this gateway"
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => e.key === "Enter" && commit()}
+        style={{ flex: 1, padding: "4px 8px", fontSize: 14, borderRadius: 4, border: "1px solid #ddd" }}
+      />
+    </label>
   );
 }
 

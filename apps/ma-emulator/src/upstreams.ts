@@ -11,13 +11,22 @@ export interface UpstreamSpec {
   name: string;
   baseUrl: string;
   /**
-   * Fixed key for this upstream. Unset means "forward the client's key", which
-   * only makes sense for the primary: the key the client sends is for it.
+   * Fixed key for this upstream. Unset means "use the key the client sends for
+   * it": `x-api-key` for the primary, `x-ma-key-<name>` for a fallback.
    */
   apiKey?: string;
   /** Requested model id → the id this upstream knows it by. `*` matches anything not listed. */
   modelMap: Record<string, string>;
 }
+
+/**
+ * Keys the client sent, by upstream name (`primary` is its `x-api-key`). Held in
+ * memory only. A key is only ever sent to the upstream it was given for.
+ */
+export type ClientKeys = Record<string, string>;
+
+/** Header carrying the client's key for one fallback upstream: `x-ma-key-fallback-2`. */
+export const UPSTREAM_KEY_HEADER_PREFIX = "x-ma-key-";
 
 /** Builds an SDK client for one upstream (tests inject a fake). */
 export type UpstreamFactory = (spec: UpstreamSpec, apiKey: string) => Anthropic;
@@ -60,10 +69,10 @@ export class UpstreamPool {
    * first) — a request is never refused just because everything failed
    * recently. Upstreams with no usable key are left out.
    */
-  candidates(model: string, clientKey: string | undefined, preferred?: string): UpstreamTarget[] {
+  candidates(model: string, clientKeys: ClientKeys, preferred?: string): UpstreamTarget[] {
     const t = this.now();
     const usable = this.specs
-      .map((spec, order) => ({ spec, order, key: spec.apiKey ?? clientKey, until: this.downUntil.get(spec.name) ?? 0 }))
+      .map((spec) => ({ spec, key: spec.apiKey ?? clientKeys[spec.name], until: this.downUntil.get(spec.name) ?? 0 }))
       .filter((u) => u.key);
     const pinned = usable.filter((u) => u.spec.name === preferred);
     const rest = usable.filter((u) => u.spec.name !== preferred);

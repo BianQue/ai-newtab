@@ -2,6 +2,7 @@ import type { EmulatorConfig } from "./config";
 import type { SessionEngine } from "./engine";
 import { publicFile, type FileService } from "./files";
 import type { Registry } from "./registry";
+import { UPSTREAM_KEY_HEADER_PREFIX, type ClientKeys } from "./upstreams";
 import { ApiError, badRequest } from "./util";
 
 /**
@@ -14,7 +15,10 @@ interface Ctx {
   req: Request;
   url: URL;
   params: string[];
+  /** The client's key for the primary upstream (`x-api-key`). */
   apiKey?: string;
+  /** Every key the client sent, by upstream name: the primary's plus any `x-ma-key-<name>`. */
+  keys: ClientKeys;
   /** `x-ma-upstream`: the upstream the client wants tried first, or "auto". Emulator-only. */
   upstream?: string;
 }
@@ -59,6 +63,7 @@ export function createRouter(s: Services) {
   // ---- health --------------------------------------------------------------------
   const primary = s.config.upstreams[0];
   const anyFixedKey = s.config.upstreams.some((u) => u.apiKey);
+  const fallbackNames = s.config.upstreams.slice(1).map((u) => u.name);
   on("GET", "/health", () =>
     json({
       ok: true,
@@ -95,16 +100,16 @@ export function createRouter(s: Services) {
   on("POST", "/v1/agents/:id/archive", ({ params }) => json(registry.archiveAgent(params[0])));
 
   // ---- sessions ----------------------------------------------------------------------
-  on("POST", "/v1/sessions", async ({ req, apiKey, upstream }) => {
-    const doc = engine.createSession(await readJson(req), apiKey);
+  on("POST", "/v1/sessions", async ({ req, keys, upstream }) => {
+    const doc = engine.createSession(await readJson(req), keys);
     if (upstream) engine.setPreferredUpstream(doc.id, upstream);
     return json(engine.view(doc));
   });
   on("GET", "/v1/sessions", () =>
     json({ data: engine.listSessions().map((d) => engine.view(d)), next_page: null, prev_page: null }),
   );
-  on("GET", "/v1/sessions/:id", ({ params, apiKey }) => {
-    engine.rememberKey(params[0], apiKey);
+  on("GET", "/v1/sessions/:id", ({ params, keys }) => {
+    engine.rememberKey(params[0], keys);
     return json(engine.view(engine.getSession(params[0])));
   });
   on("POST", "/v1/sessions/:id", async ({ req, params }) =>
@@ -114,8 +119,8 @@ export function createRouter(s: Services) {
   on("POST", "/v1/sessions/:id/archive", ({ params }) => json(engine.view(engine.archiveSession(params[0]))));
 
   // ---- events ------------------------------------------------------------------------
-  on("GET", "/v1/sessions/:id/events", ({ params, url, apiKey }) => {
-    engine.rememberKey(params[0], apiKey);
+  on("GET", "/v1/sessions/:id/events", ({ params, url, keys }) => {
+    engine.rememberKey(params[0], keys);
     const limit = url.searchParams.get("limit");
     const order = url.searchParams.get("order");
     return json(
@@ -126,11 +131,11 @@ export function createRouter(s: Services) {
       }),
     );
   });
-  on("POST", "/v1/sessions/:id/events", async ({ req, params, apiKey }) => {
+  on("POST", "/v1/sessions/:id/events", async ({ req, params, keys }) => {
     const body = await readJson(req);
-    return json(engine.sendEvents(params[0], body.events, apiKey));
+    return json(engine.sendEvents(params[0], body.events, keys));
   });
-  on("GET", "/v1/sessions/:id/events/stream", ({ req, params, apiKey }) => {
+  on("GET", "/v1/sessions/:id/events/stream", ({ req, params, keys }) => {
     const sessionId = params[0];
     engine.getSession(sessionId); // 404 before opening a stream
     const enc = new TextEncoder();
@@ -171,7 +176,7 @@ export function createRouter(s: Services) {
       },
     });
     // Attaching a stream is also how a client says "I'm back" after an emulator restart.
-    engine.rememberKey(sessionId, apiKey);
+    engine.rememberKey(sessionId, keys);
     return new Response(body, {
       headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" },
     });
@@ -245,6 +250,13 @@ export function createRouter(s: Services) {
     try {
       const apiKey =
         req.headers.get("x-api-key") ?? req.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? undefined;
+      const keys: ClientKeys = {};
+      if (apiKey) keys.primary = apiKey;
+      for (const name of fallbackNames) {
+        // Present but empty means "forget the key I sent before".
+        const k = req.headers.get(UPSTREAM_KEY_HEADER_PREFIX + name);
+        if (k !== null) keys[name] = k.trim();
+      }
       if (!apiKey && !anyFixedKey && url.pathname.startsWith("/v1/")) {
         throw new ApiError(401, "authentication_error", "x-api-key header is required");
       }
@@ -261,7 +273,7 @@ export function createRouter(s: Services) {
       const upstream = req.headers.get("x-ma-upstream")?.trim() || undefined;
       const sessionPath = url.pathname.match(/^\/v1\/sessions\/(sesn_[^/]+)/);
       if (upstream && sessionPath) engine.setPreferredUpstream(decodeURIComponent(sessionPath[1]), upstream);
-      res = await match[2]({ req, url, params, apiKey, upstream });
+      res = await match[2]({ req, url, params, apiKey, keys, upstream });
     } catch (err) {
       if (err instanceof ApiError) res = err.toResponse();
       else {
