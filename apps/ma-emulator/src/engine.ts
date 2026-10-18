@@ -7,6 +7,7 @@ import type { AgentDoc, Registry } from "./registry";
 import { OUTPUT_ROOT, Sandbox, UPLOAD_ROOT } from "./sandbox";
 import type { NewEvent, StoredEvent, Store } from "./store";
 import { ALL_TOOLSET_NAMES, BUILTIN_TOOL_DEFS, SUPPORTED_BUILTINS, runBuiltinTool, type BuiltinToolName } from "./toolset";
+import type { UpstreamPool, UpstreamTarget } from "./upstreams";
 import { ApiError, badRequest, conflict, newId, notFound, nowIso, sleep } from "./util";
 
 /**
@@ -22,7 +23,8 @@ import { ApiError, badRequest, conflict, newId, notFound, nowIso, sleep } from "
  *     re-derived from the log and pick up where they stopped.
  *
  * The model is called through any `/v1/messages` upstream (Anthropic or a
- * compatible gateway); the built-in file tools run here, against the session's
+ * compatible gateway), failing over to the next configured upstream when one
+ * errors or stalls; the built-in file tools run here, against the session's
  * sandbox; custom tools are handed to the client via `requires_action`.
  */
 
@@ -87,8 +89,6 @@ export interface StreamListener {
   onClose(): void;
 }
 
-export type UpstreamFactory = (apiKey: string) => Anthropic;
-
 interface Runner {
   driving: boolean;
   again: boolean;
@@ -121,7 +121,7 @@ export class SessionEngine {
     private readonly registry: Registry,
     private readonly files: FileService,
     private readonly config: EmulatorConfig,
-    private readonly upstream: UpstreamFactory,
+    private readonly upstreams: UpstreamPool,
     private readonly log: (line: string) => void = (l) => console.log(l),
   ) {}
 
@@ -493,8 +493,8 @@ export class SessionEngine {
         return;
       }
 
-      const apiKey = this.config.upstreamApiKey ?? this.keys.get(sessionId);
-      if (!apiKey) {
+      const clientKey = this.keys.get(sessionId);
+      if (this.upstreams.candidates(session.agent.model.id, clientKey).length === 0) {
         if (session.status !== "rescheduling") {
           this.append(sessionId, [{ body: event("session.status_rescheduled") }]);
         }
@@ -524,7 +524,7 @@ export class SessionEngine {
         return;
       }
 
-      const outcome = await this.callModel(sessionId, session, d, apiKey, runner);
+      const outcome = await this.callModel(sessionId, session, d, clientKey, runner);
       if (outcome === "stop") return;
     }
   }
@@ -552,14 +552,13 @@ export class SessionEngine {
     sessionId: string,
     session: SessionDoc,
     d: Derived,
-    apiKey: string,
+    clientKey: string | undefined,
     runner: Runner,
   ): Promise<"continue" | "stop"> {
     const agent = session.agent;
     const tools = this.toolsFor(agent, sessionId);
     const customNames = new Set(agent.tools.filter((t) => t.type === "custom").map((t) => t.name as string));
-    const params: Anthropic.MessageStreamParams = {
-      model: agent.model.id,
+    const params: Omit<Anthropic.MessageStreamParams, "model"> = {
       max_tokens: this.config.maxTokens,
       messages: withCacheBreakpoint(d.messages),
       ...(agent.system
@@ -570,14 +569,23 @@ export class SessionEngine {
 
     const controller = new AbortController();
     runner.abort = controller;
-    const client = this.upstream(apiKey);
+    // Upstreams this request has been sent to; an untried one is preferred over
+    // retrying a failed one, and switching to it doesn't wait out a backoff.
+    const tried = new Set<string>();
     try {
       for (let attempt = 0; ; attempt++) {
+        const targets = this.upstreams.candidates(agent.model.id, clientKey);
+        if (targets.length === 0) return "continue"; // no usable key; drive() parks the session
+        const target = targets.find((t) => !tried.has(t.name)) ?? targets[0];
+        tried.add(target.name);
+
         const start = event("span.model_request_start");
         this.append(sessionId, [{ body: start }]);
+        let stalled = false;
         try {
-          const msg = await client.messages.stream(params, { signal: controller.signal }).finalMessage();
-          this.recordResponse(sessionId, start.id, msg, customNames);
+          const msg = await this.streamOnce(target, params, controller.signal, () => (stalled = true));
+          this.upstreams.markOk(target.name);
+          this.recordResponse(sessionId, start.id, msg, customNames, target);
           return "continue";
         } catch (err) {
           if (this.stopping) return "stop";
@@ -589,20 +597,35 @@ export class SessionEngine {
           this.append(sessionId, [{ body: endError }]);
           if (controller.signal.aborted) return "continue"; // interrupt: drive() re-derives and goes idle
 
-          const status = (err as any)?.status as number | undefined;
+          this.upstreams.markFailed(target.name);
+
+          const status = stalled ? undefined : ((err as any)?.status as number | undefined);
           const retryable = status === undefined || status === 408 || status === 409 || status === 429 || status >= 500;
-          const message = err instanceof Error ? err.message : String(err);
+          const reason = stalled
+            ? `no data from the upstream for ${Math.round(this.config.stallTimeoutMs / 1000)}s`
+            : err instanceof Error
+              ? err.message
+              : String(err);
+          const message = this.upstreams.specs.length > 1 ? `[${target.name}] ${reason}` : reason;
           const errorType =
             status === 429 ? "model_rate_limited_error" : status === 529 ? "model_overloaded_error" : "model_request_failed_error";
-          this.log(`[session ${sessionId}] model request failed (${status ?? "network"}): ${message.slice(0, 300)}`);
+          // An error one gateway returns (bad key, unknown model, its own outage
+          // reported as a 4xx) may not happen on another, so even a non-retryable
+          // failure moves on to an upstream this request hasn't tried yet.
+          const untried = this.upstreams.candidates(agent.model.id, clientKey).find((t) => !tried.has(t.name));
+          this.log(
+            `[session ${sessionId}] model request via ${target.name} failed ` +
+              `(${stalled ? "stalled" : (status ?? "network")}): ${reason.slice(0, 300)}` +
+              (untried ? ` — switching to ${untried.name}` : ""),
+          );
 
-          if (retryable && attempt < this.config.maxRetries) {
+          if ((retryable || untried) && attempt < this.config.maxRetries) {
             this.append(sessionId, [
               { body: event("session.error", { error: { type: errorType, message, retry_status: { type: "retrying" } } }) },
               { body: event("session.status_rescheduled") },
             ]);
             try {
-              await sleep(this.config.retryBaseDelayMs * 2 ** attempt, controller.signal);
+              await sleep(untried ? 0 : this.config.retryBaseDelayMs * 2 ** attempt, controller.signal);
             } catch {
               return this.stopping ? "stop" : "continue";
             }
@@ -626,8 +649,48 @@ export class SessionEngine {
     }
   }
 
+  /**
+   * One streamed model call. A watchdog aborts it when the upstream goes quiet
+   * for `stallTimeoutMs` — before the first event or between two — so a gateway
+   * that accepts the connection and then hangs fails fast, while a long but
+   * flowing response (a 20KB homepage takes minutes) is left alone.
+   */
+  private streamOnce(
+    target: UpstreamTarget,
+    params: Omit<Anthropic.MessageStreamParams, "model">,
+    outer: AbortSignal,
+    onStall: () => void,
+  ): Promise<Anthropic.Message> {
+    const ctl = new AbortController();
+    const forward = () => ctl.abort(outer.reason);
+    if (outer.aborted) forward();
+    else outer.addEventListener("abort", forward, { once: true });
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const arm = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        onStall();
+        ctl.abort(new Error("upstream stalled"));
+      }, this.config.stallTimeoutMs);
+    };
+    arm();
+    const stream = target.client.messages.stream({ ...params, model: target.model }, { signal: ctl.signal });
+    stream.on("streamEvent", arm);
+    return stream.finalMessage().finally(() => {
+      clearTimeout(timer);
+      outer.removeEventListener("abort", forward);
+    });
+  }
+
   /** One model response → one atomic batch: the span end (carrying the raw content) plus its public events. */
-  private recordResponse(sessionId: string, startId: string, msg: Anthropic.Message, customNames: Set<string>) {
+  private recordResponse(
+    sessionId: string,
+    startId: string,
+    msg: Anthropic.Message,
+    customNames: Set<string>,
+    target: UpstreamTarget,
+  ) {
     let content = msg.content as Anthropic.ContentBlock[];
     let continuation: string | undefined;
 
@@ -692,7 +755,8 @@ export class SessionEngine {
       },
     });
     this.log(
-      `[session ${sessionId}] model: stop=${msg.stop_reason} in=${usage.input_tokens} ` +
+      `[session ${sessionId}] model${this.upstreams.specs.length > 1 ? ` (${target.name}: ${target.model})` : ""}: ` +
+        `stop=${msg.stop_reason} in=${usage.input_tokens} ` +
         `cache_read=${usage.cache_read_input_tokens ?? 0} out=${usage.output_tokens} ` +
         `blocks=${content.map((b) => (b.type === "tool_use" ? `tool_use(${b.name})` : b.type)).join(",")}`,
     );

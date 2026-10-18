@@ -4,43 +4,61 @@ import { join } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import type { BrowserBridge, KVStore } from "@homepage/agent-core";
 import type { EmulatorConfig } from "../src/config";
-import type { UpstreamFactory } from "../src/engine";
 import { startEmulator, type Emulator } from "../src/server";
+import type { UpstreamFactory } from "../src/upstreams";
 
 export const TEST_KEY = "sk-test-key";
 
-/** One scripted model turn: given the request, return the reply (or throw an APIError-like). */
-export type Turn = (params: Anthropic.MessageStreamParams, signal?: AbortSignal) => Anthropic.Message | Promise<Anthropic.Message>;
+/**
+ * One scripted model turn: given the request, return the reply (or throw an
+ * APIError-like). `emit` stands for a stream event arriving (it feeds the stall
+ * watchdog); `upstream` is the name of the upstream the request was sent to.
+ */
+export type Turn = (
+  params: Anthropic.MessageStreamParams,
+  signal?: AbortSignal,
+  emit?: () => void,
+  upstream?: string,
+) => Anthropic.Message | Promise<Anthropic.Message>;
 
 export interface FakeModel {
   upstream: UpstreamFactory;
   requests: Anthropic.MessageStreamParams[];
   keysSeen: string[];
+  /** The upstream each request went to, in order. */
+  upstreamsSeen: string[];
   remaining(): number;
 }
 
-/** A stand-in for `/v1/messages` that plays a fixed script, one turn per request. */
+/** A stand-in for every upstream's `/v1/messages`: plays a fixed script, one turn per request. */
 export function fakeModel(turns: Turn[]): FakeModel {
   const queue = [...turns];
   const requests: Anthropic.MessageStreamParams[] = [];
   const keysSeen: string[] = [];
-  const upstream: UpstreamFactory = (apiKey) =>
+  const upstreamsSeen: string[] = [];
+  const upstream: UpstreamFactory = (spec, apiKey) =>
     ({
       messages: {
         stream: (params: Anthropic.MessageStreamParams, opts?: { signal?: AbortSignal }) => {
           keysSeen.push(apiKey);
+          upstreamsSeen.push(spec.name);
           requests.push(structuredClone(params));
           const turn = queue.shift();
+          const listeners: (() => void)[] = [];
           return {
+            on(ev: string, cb: () => void) {
+              if (ev === "streamEvent") listeners.push(cb);
+              return this;
+            },
             finalMessage: async () => {
               if (!turn) throw new Error("fake model: script exhausted");
-              return turn(params, opts?.signal);
+              return turn(params, opts?.signal, () => listeners.forEach((l) => l()), spec.name);
             },
           };
         },
       },
     }) as unknown as Anthropic;
-  return { upstream, requests, keysSeen, remaining: () => queue.length };
+  return { upstream, requests, keysSeen, upstreamsSeen, remaining: () => queue.length };
 }
 
 let toolSeq = 0;
@@ -85,11 +103,14 @@ export function testConfig(dataDir: string, overrides: Partial<EmulatorConfig> =
     port: 0,
     hostname: "127.0.0.1",
     dataDir,
-    upstreamBaseUrl: "http://upstream.invalid",
+    upstreams: [{ name: "primary", baseUrl: "http://upstream.invalid", modelMap: {} }],
     maxTokens: 1000,
     maxTurns: 20,
     maxRetries: 2,
     retryBaseDelayMs: 5,
+    // Tests that hang a model call on purpose (restart, interrupt) must not trip the watchdog.
+    stallTimeoutMs: 60_000,
+    upstreamCooldownMs: 60_000,
     ...overrides,
   };
 }

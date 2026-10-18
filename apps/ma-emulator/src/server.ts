@@ -1,10 +1,11 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { loadConfig, type EmulatorConfig } from "./config";
-import { SessionEngine, type UpstreamFactory } from "./engine";
+import { SessionEngine } from "./engine";
 import { FileService } from "./files";
 import { Registry } from "./registry";
 import { createRouter } from "./routes";
 import { Store } from "./store";
+import { UpstreamPool, type UpstreamFactory } from "./upstreams";
 
 export interface Emulator {
   url: string;
@@ -27,20 +28,23 @@ export function startEmulator(config: EmulatorConfig, opts: EmulatorOptions = {}
   const files = new FileService(store);
 
   const clients = new Map<string, Anthropic>();
-  const upstream: UpstreamFactory =
+  const factory: UpstreamFactory =
     opts.upstream ??
-    ((apiKey) => {
-      let client = clients.get(apiKey);
+    ((spec, apiKey) => {
+      const cacheKey = `${spec.name}\0${apiKey}`;
+      let client = clients.get(cacheKey);
       if (!client) {
-        // Retries are the session's job (they show up as session.error /
-        // status_rescheduled events), so the SDK's own are off.
-        client = new Anthropic({ apiKey, baseURL: config.upstreamBaseUrl, maxRetries: 0, timeout: 10 * 60_000 });
-        clients.set(apiKey, client);
+        // Retries and failover are the session's job (they show up as
+        // session.error / status_rescheduled events), so the SDK's own are off.
+        // Stalls are caught by the session's watchdog; this is only a backstop.
+        client = new Anthropic({ apiKey, baseURL: spec.baseUrl, maxRetries: 0, timeout: 10 * 60_000 });
+        clients.set(cacheKey, client);
       }
       return client;
     });
+  const upstreams = new UpstreamPool(config.upstreams, factory, config.upstreamCooldownMs);
 
-  const engine = new SessionEngine(store, registry, files, config, upstream, log);
+  const engine = new SessionEngine(store, registry, files, config, upstreams, log);
   const handle = createRouter({ config, registry, files, engine, log });
 
   // idleTimeout 0: event streams stay open for as long as a build runs.
@@ -67,13 +71,13 @@ if (import.meta.main) {
   const config = loadConfig();
   const emu = startEmulator(config);
   console.log(`Managed Agents emulator listening on ${emu.url}`);
-  console.log(`  upstream /v1/messages: ${config.upstreamBaseUrl}`);
-  console.log(`  data dir:              ${config.dataDir}`);
-  console.log(
-    config.upstreamApiKey
-      ? "  upstream key:          fixed (MA_UPSTREAM_API_KEY)"
-      : "  upstream key:          forwarded from each client request, held in memory only",
-  );
+  for (const u of config.upstreams) {
+    const key = u.apiKey ? "fixed key" : "client's key (in memory only)";
+    const map = Object.entries(u.modelMap).map(([from, to]) => `${from}→${to}`).join(", ");
+    console.log(`  upstream ${u.name.padEnd(11)} ${u.baseUrl}  [${key}]${map ? `  models: ${map}` : ""}`);
+  }
+  console.log(`  stall timeout:       ${config.stallTimeoutMs / 1000}s`);
+  console.log(`  data dir:            ${config.dataDir}`);
   const shutdown = async () => {
     await emu.stop();
     process.exit(0);

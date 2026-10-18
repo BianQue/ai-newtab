@@ -49,7 +49,36 @@ Then point a client at it:
 | `MA_UPSTREAM_API_KEY` | unset | fixed upstream key; see *Keys* |
 | `MA_PORT` / `MA_HOST` | `8787` / `127.0.0.1` | |
 | `MA_DATA_DIR` | `apps/ma-emulator/.data` | sqlite db, file blobs, sandboxes |
+| `MA_UPSTREAM_MODEL_MAP` | unset | rename models for the primary, e.g. `claude-sonnet-5-5=other-model` |
+| `MA_UPSTREAM_2_BASE_URL` / `_2_API_KEY` / `_2_MODEL_MAP` | unset | a fallback upstream (then `_3_`, …); needs its own key |
+| `MA_STALL_TIMEOUT_MS` | `60000` | a model call that receives nothing for this long is abandoned |
+| `MA_UPSTREAM_COOLDOWN_MS` | `300000` | how long a failed upstream is skipped |
 | `MA_MAX_TOKENS` / `MA_MAX_TURNS` / `MA_MAX_RETRIES` | `32000` / `80` / `4` | |
+
+### Stalls and fallback gateways
+
+Some gateways accept a request and then send nothing. Every model call is
+watched: if no stream event arrives for `MA_STALL_TIMEOUT_MS` — before the first
+byte or mid-response — the call is aborted and retried. A response that keeps
+flowing is never cut off, however long it runs.
+
+With fallbacks configured, a failed or stalled call moves straight on to the
+next upstream (no backoff), and the failed one sits out `MA_UPSTREAM_COOLDOWN_MS`
+so later calls skip it. Even a non-retryable error (an unknown model, a bad key,
+an outage reported as 4xx) moves on to an upstream the call hasn't tried. Each
+fallback has its own key and can rename models, so a gateway that serves other
+models can stand in. `*` maps every model not listed:
+
+```bash
+# .env
+MA_UPSTREAM_BASE_URL=https://primary-gateway
+MA_UPSTREAM_2_BASE_URL=https://backup-gateway
+MA_UPSTREAM_2_API_KEY=sk-...
+MA_UPSTREAM_2_MODEL_MAP=claude-sonnet-5-5=glm-5.3-flash,claude-opus-5-5=kimi-k3,claude-haiku-5-5=deepseek-v4-flash
+```
+
+Failover applies to sessions. The `/v1/messages` passthrough always goes to the
+primary.
 
 ## Semantics it reproduces
 
@@ -92,7 +121,8 @@ By default the emulator stores no key. It forwards the key each client request
 carries and keeps it **in memory only**. A session recovered after a restart
 waits in `rescheduling` until any request on it (stream, list, retrieve, send)
 supplies a key again. Set `MA_UPSTREAM_API_KEY` to let sessions resume with no
-client at all (clients may then send any key).
+client at all (clients may then send any key). A fallback's fixed key has the
+same effect: a recovered session with no client key goes to that fallback.
 
 ## Not emulated
 

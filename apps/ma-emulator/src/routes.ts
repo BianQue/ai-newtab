@@ -55,8 +55,15 @@ export function createRouter(s: Services) {
     routes.push([method, new RegExp("^" + pattern.replace(/:\w+/g, "([^/]+)") + "$"), handler]);
 
   // ---- health --------------------------------------------------------------------
+  const primary = s.config.upstreams[0];
+  const anyFixedKey = s.config.upstreams.some((u) => u.apiKey);
   on("GET", "/health", () =>
-    json({ ok: true, upstream: s.config.upstreamBaseUrl, fixedKey: Boolean(s.config.upstreamApiKey) }),
+    json({
+      ok: true,
+      upstream: primary.baseUrl,
+      upstreams: s.config.upstreams.map((u) => ({ name: u.name, baseUrl: u.baseUrl, fixedKey: Boolean(u.apiKey) })),
+      fixedKey: anyFixedKey,
+    }),
   );
 
   // ---- environments ----------------------------------------------------------------
@@ -198,14 +205,15 @@ export function createRouter(s: Services) {
   });
 
   // ---- plain Messages API: pass through, so one base URL serves both modes ---------------
+  // (to the primary only: no failover or model mapping on this path)
   const passthrough: Handler = async ({ req, url, apiKey }) => {
     const headers = new Headers();
     for (const h of ["content-type", "anthropic-version", "anthropic-beta", "accept"]) {
       const v = req.headers.get(h);
       if (v) headers.set(h, v);
     }
-    headers.set("x-api-key", s.config.upstreamApiKey ?? apiKey ?? "");
-    const upstream = await fetch(s.config.upstreamBaseUrl + url.pathname + url.search, {
+    headers.set("x-api-key", primary.apiKey ?? apiKey ?? "");
+    const upstream = await fetch(primary.baseUrl + url.pathname + url.search, {
       method: req.method,
       headers,
       body: req.method === "GET" ? undefined : await req.arrayBuffer(),
@@ -228,7 +236,7 @@ export function createRouter(s: Services) {
     try {
       const apiKey =
         req.headers.get("x-api-key") ?? req.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? undefined;
-      if (!apiKey && !s.config.upstreamApiKey && url.pathname.startsWith("/v1/")) {
+      if (!apiKey && !anyFixedKey && url.pathname.startsWith("/v1/")) {
         throw new ApiError(401, "authentication_error", "x-api-key header is required");
       }
       const match = routes.find(([m, re]) => m === req.method && re.test(url.pathname));

@@ -106,7 +106,7 @@ test("the session outlives the emulator: a restart mid-turn resumes from the eve
 
 test("with a fixed upstream key, a recovered session resumes without any client", async () => {
   const first = fakeModel([hang()]);
-  h = startHarness(first, { upstreamApiKey: "sk-fixed" });
+  h = startHarness(first, { upstreams: [{ name: "primary", baseUrl: "http://upstream.invalid", apiKey: "sk-fixed", modelMap: {} }] });
   const { session } = await setup(h);
   await say(h, session.id, "hello");
   await waitFor(() => first.requests.length === 1, "first model request");
