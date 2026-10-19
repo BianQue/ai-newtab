@@ -10,6 +10,9 @@ import { HomepagePreview } from "./components/HomepagePreview";
 import { SettingsModal } from "./components/SettingsModal";
 import { btn, errorBox } from "./components/ui";
 import { useHomepageBuild } from "./useHomepageBuild";
+import { useMeetings } from "./useMeetings";
+import { MeetingControls } from "./components/MeetingControls";
+import { hasMeetingRuntime } from "@/lib/meeting-protocol";
 
 export default function App() {
   const [loading, setLoading] = useState(true);
@@ -24,6 +27,7 @@ export default function App() {
   const [intervalHours, setIntervalHours] = useState(DEFAULT_REBUILD_INTERVAL_HOURS);
   /** Transpiled homepage, ready for Sandpack. */
   const [renderedCode, setRenderedCode] = useState<string | null>(null);
+  const [meetingRuntimeVersion, setMeetingRuntimeVersion] = useState<1 | undefined>();
   /** A session left mid-flight, offered as "Resume interrupted build". */
   const [resumable, setResumable] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -32,7 +36,11 @@ export default function App() {
   /** The error the user dismissed, so a stale banner doesn't linger. */
   const [dismissedError, setDismissedError] = useState<string | null>(null);
 
-  const { state, build, cancel } = useHomepageBuild((code) => setRenderedCode(toRenderable(code)));
+  const meetings = useMeetings();
+  const { state, build, cancel } = useHomepageBuild((code) => {
+    setRenderedCode(toRenderable(code));
+    setMeetingRuntimeVersion(hasMeetingRuntime(code) ? 1 : undefined);
+  });
 
   // Once a build finishes, drop back to the homepage view.
   useEffect(() => {
@@ -59,7 +67,10 @@ export default function App() {
         setAutoRebuild(settings.autoRebuild);
         setIntervalHours(settings.rebuildIntervalHours ?? DEFAULT_REBUILD_INTERVAL_HOURS);
         setResumable(activeSession ?? null);
-        if (homepage?.code) setRenderedCode(toRenderable(homepage.code));
+        if (homepage?.code) {
+          setRenderedCode(toRenderable(homepage.code));
+          setMeetingRuntimeVersion(homepage.meetingRuntimeVersion);
+        }
       } finally {
         setLoading(false);
       }
@@ -103,7 +114,6 @@ export default function App() {
       setBlockedSites(sites);
       setSystemPrompt(prompt);
       setShowSettings(false);
-      setRenderedCode(null);
       build();
     },
     [build],
@@ -138,22 +148,27 @@ export default function App() {
   }, []);
 
   if (loading) return <div style={{ padding: 20, textAlign: "center" }}>Loading…</div>;
-  if (!apiKey) return <ApiKeySetup initialBaseUrl={baseUrl} initialUpstreamKeys={upstreamKeys} onSave={saveKey} />;
+  const meetingControls = <MeetingControls state={meetings.state} onRefresh={meetings.refresh}
+    onConnect={meetings.connect} hasRuntime={meetingRuntimeVersion === 1} onRebuild={() => build()} />;
+  const standaloneMeetingControls = <div style={{ position: "fixed", top: 20, right: 20, zIndex: 1000 }}>
+    {meetingControls}
+  </div>;
+  if (!apiKey) return <>{standaloneMeetingControls}<ApiKeySetup initialBaseUrl={baseUrl} initialUpstreamKeys={upstreamKeys} onSave={saveKey} /></>;
 
   // With no homepage to fall back to, a running build takes over the tab.
   if (state.running && (!renderedCode || viewProgress)) {
     return (
-      <BuildProgress
+      <>{standaloneMeetingControls}<BuildProgress
         state={state}
         onCancel={cancel}
         onBack={renderedCode ? () => setViewProgress(false) : undefined}
-      />
+      /></>
     );
   }
 
   if (!renderedCode) {
     return (
-      <div style={{ maxWidth: 560, margin: "14vh auto", padding: 24, fontFamily: "system-ui" }}>
+      <>{standaloneMeetingControls}<div style={{ maxWidth: 560, margin: "14vh auto", padding: 24, fontFamily: "system-ui" }}>
         <h1 style={{ fontSize: 26 }}>Build your homepage</h1>
         <p style={{ color: "#555", lineHeight: 1.6 }}>
           The agent reads your browsing history, opens the pages you actually follow, and writes a
@@ -178,15 +193,17 @@ export default function App() {
             Change API key / gateway
           </button>
         </div>
-      </div>
+      </div></>
     );
   }
 
   const showError = state.error && dismissedError !== state.error;
 
   return (
-    <div style={{ height: "100vh", width: "100vw" }}>
-      <div style={{ position: "fixed", top: 20, right: 20, zIndex: 999, display: "flex", gap: 8 }}>
+    <div style={{ height: "100vh", width: "100%", display: "flex", flexDirection: "column" }}>
+      <div style={{ position: "relative", zIndex: 999, display: "flex", gap: 8, padding: "12px 20px",
+        flexWrap: "wrap", justifyContent: "flex-end", flexShrink: 0 }}>
+        {meetingControls}
         {state.running ? (
           // A build is running in the background (from here, another tab, or the
           // scheduled rebuild). Let the user watch it without losing this page.
@@ -220,10 +237,9 @@ export default function App() {
         <div
           style={{
             ...errorBox,
-            position: "fixed",
-            top: 20,
-            left: 20,
-            right: 260,
+            position: "relative",
+            margin: "0 20px 12px",
+            flexShrink: 0,
             zIndex: 999,
             padding: "10px 14px",
             borderRadius: 6,
@@ -255,7 +271,8 @@ export default function App() {
         </div>
       )}
 
-      <HomepagePreview code={renderedCode} />
+      <HomepagePreview code={renderedCode} meetingState={meetings.state} onRefreshMeetings={meetings.refresh}
+        onConnectMeetings={meetings.connect} meetingRuntimeVersion={meetingRuntimeVersion} />
 
       {showSettings && (
         <SettingsModal

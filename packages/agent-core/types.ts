@@ -6,6 +6,7 @@
  * harness supplies one backed by fixtures and `fetch`. Nothing in this package
  * may import `chrome`, `browser`, or `node:*`.
  */
+import type { MeetingAuthorizationResult } from "./meetings";
 
 /** One domain's worth of browsing history, narrowed to fit in a context window. */
 export interface SiteDigest {
@@ -72,6 +73,9 @@ export interface ScrapedPage {
  * (a filesystem, grep, read) is supplied by the session sandbox.
  */
 export interface BrowserBridge {
+  /** Starts a trusted host authorization request; never waits for the user to sign in. */
+  requestMeetingAuthorization?(): Promise<MeetingAuthorizationResult>;
+
   getHistory(args: {
     daysToAnalyze: number;
     maxResults: number;
@@ -111,6 +115,7 @@ export interface RunCallbacks {
 
 export interface HomepageBuildResult {
   code: string;
+  meetingRuntimeVersion?: 1;
   sessionId: string;
   /** Where the code came from: a session output file, or a fenced block in the final message. */
   source: "session-output" | "message-fence";

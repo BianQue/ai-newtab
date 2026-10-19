@@ -6,12 +6,15 @@ import { Registry } from "./registry";
 import { createRouter } from "./routes";
 import { Store } from "./store";
 import { UpstreamPool, type UpstreamFactory } from "./upstreams";
+import { createMeetingCli, type MeetingCli } from "./tmeet-cli";
+import { MeetingService } from "./tmeet";
 
 export interface Emulator {
   url: string;
   config: EmulatorConfig;
   engine: SessionEngine;
   store: Store;
+  meetings: MeetingService;
   stop(): Promise<void>;
 }
 
@@ -19,6 +22,7 @@ export interface EmulatorOptions {
   /** Override how model calls are made (tests inject a fake upstream). */
   upstream?: UpstreamFactory;
   log?: (line: string) => void;
+  meetingCli?: MeetingCli;
 }
 
 export function startEmulator(config: EmulatorConfig, opts: EmulatorOptions = {}): Emulator {
@@ -45,21 +49,25 @@ export function startEmulator(config: EmulatorConfig, opts: EmulatorOptions = {}
   const upstreams = new UpstreamPool(config.upstreams, factory, config.upstreamCooldownMs);
 
   const engine = new SessionEngine(store, registry, files, config, upstreams, log);
-  const handle = createRouter({ config, registry, files, engine, log });
+  const meetings = new MeetingService(opts.meetingCli ?? createMeetingCli({ executable: config.tmeetExecutable, proxy: config.tmeetProxy }), config.dataDir);
+  const handle = createRouter({ config, registry, files, engine, meetings, log });
 
   // idleTimeout 0: event streams stay open for as long as a build runs.
   const server = Bun.serve({ port: config.port, hostname: config.hostname, idleTimeout: 0, fetch: handle });
   const url = `http://${config.hostname}:${server.port}`;
 
   engine.recover();
+  meetings.recover();
 
   return {
     url,
     config,
     engine,
     store,
+    meetings,
     async stop() {
       engine.abortAll();
+      await meetings.stop();
       await engine.quiesce(5_000);
       server.stop(true);
       store.close();

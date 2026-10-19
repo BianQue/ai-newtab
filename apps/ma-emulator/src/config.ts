@@ -30,6 +30,10 @@ export interface EmulatorConfig {
   stallTimeoutMs: number;
   /** How long a failed upstream is skipped in favour of the next one. */
   upstreamCooldownMs: number;
+  tmeetApiKey?: string;
+  tmeetOrigins?: string[];
+  tmeetExecutable?: string;
+  tmeetProxy?: string;
 }
 
 const DEFAULT_UPSTREAM = "https://api.anthropic.com";
@@ -78,6 +82,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     retryBaseDelayMs: Number(env.MA_RETRY_BASE_DELAY_MS ?? 2_000),
     stallTimeoutMs: Number(env.MA_STALL_TIMEOUT_MS ?? 60_000),
     upstreamCooldownMs: Number(env.MA_UPSTREAM_COOLDOWN_MS ?? 5 * 60_000),
+    tmeetApiKey: env.MA_TMEET_API_KEY || undefined,
+    tmeetOrigins: (env.MA_TMEET_ORIGINS ?? "").split(",").map((origin) => origin.trim()).filter(Boolean),
+    tmeetExecutable: env.MA_TMEET_EXECUTABLE || undefined,
+    tmeetProxy: env.MA_TMEET_PROXY || undefined,
   };
 }
 

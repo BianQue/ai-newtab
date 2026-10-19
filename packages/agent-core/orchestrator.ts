@@ -3,6 +3,7 @@ import { buildHistoryDigest, slugifyUrl } from "./history-digest";
 import { OUTPUT_PATH, buildKickoffMessage } from "./prompt";
 import { DEFAULT_BLOCKED_SITES, isAllowedUrl, isBlocked, normalizeBlockList } from "./site-filter";
 import { DEFAULTS } from "./schemas";
+import { hasMeetingRuntime, MEETING_RUNTIME_VERSION, type MeetingAuthorizationResult } from "./meetings";
 import { STORAGE_KEYS, ensureAgent, ensureEnvironment, type HomepageModel } from "./setup";
 import type {
   BrowserBridge,
@@ -97,13 +98,16 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
       const blockedSites = normalizeBlockList(
         (typeof opts.blockedSites === "function" ? await opts.blockedSites() : opts.blockedSites) ?? DEFAULT_BLOCKED_SITES,
       );
-      let result: GetHistoryResult | GetPageHtmlResult;
+      let result: GetHistoryResult | GetPageHtmlResult | MeetingAuthorizationResult;
       switch (event.name) {
         case "getHistory":
           result = await runGetHistory(event, bridge, emit, blockedSites);
           break;
         case "getPageHtml":
           result = await runGetPageHtml(event, { client, bridge, sessionId: sessionId!, rememberUpload, emit, blockedSites });
+          break;
+        case "requestMeetingAuthorization":
+          result = await runRequestMeetingAuthorization(event, bridge);
           break;
         default:
           throw new Error(`Unknown custom tool: ${event.name}`);
@@ -240,8 +244,17 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
 
     emit.phase("writing");
     const code = await collectDeliverable(client, sessionId, finalMessage, emit);
+    const meetingsEnabled = hasMeetingRuntime(code.code);
+    if (bridge.requestMeetingAuthorization && !meetingsEnabled) {
+      throw new Error("Generated homepage is missing the required @homepage/meetings useMeetingData() runtime. Rebuild the page.");
+    }
     emit.phase("done");
-    return { code: code.code, sessionId, source: code.source };
+    return {
+      code: code.code,
+      sessionId,
+      source: code.source,
+      ...(meetingsEnabled ? { meetingRuntimeVersion: MEETING_RUNTIME_VERSION } : {}),
+    };
   } finally {
     // Privacy: the event log holds every domain, title and page body we sent,
     // and uploads persist independently of the session. Delete both, always.
@@ -260,6 +273,32 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
 // ---------------------------------------------------------------------------
 // tool implementations
 // ---------------------------------------------------------------------------
+
+async function runRequestMeetingAuthorization(
+  event: CustomToolUse,
+  bridge: BrowserBridge,
+): Promise<MeetingAuthorizationResult> {
+  if (!event.input || typeof event.input !== "object" || Array.isArray(event.input) || Object.keys(event.input).length) {
+    throw new Error("requestMeetingAuthorization accepts no arguments");
+  }
+  if (!bridge.requestMeetingAuthorization) return { status: "unavailable" };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      bridge.requestMeetingAuthorization(),
+      new Promise<MeetingAuthorizationResult>((resolve) => {
+        timer = setTimeout(() => resolve({ status: "pending" }), 5_000);
+      }),
+    ]);
+    // A host may carry sensitive fields internally. Only the status reaches the model.
+    const status = result?.status;
+    return { status: ["disconnected", "pending", "connected", "expired", "error", "unavailable"].includes(status) ? status : "error" };
+  } catch {
+    return { status: "error" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function runGetHistory(
   event: CustomToolUse,

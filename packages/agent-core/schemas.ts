@@ -62,3 +62,10 @@ export const DEFAULTS = {
   /** Cap on titles carried per domain in the digest. */
   sampleTitles: 5,
 } as const;
+
+export const REQUEST_MEETING_AUTHORIZATION_SCHEMA: ToolInputSchema = {
+  type: "object",
+  properties: {},
+  required: [],
+  additionalProperties: false,
+};

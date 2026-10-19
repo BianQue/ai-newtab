@@ -91,6 +91,52 @@ resent at once. `/health` lists the upstreams and their model maps. The
 extension's Settings uses that list for its **Upstream gateway** menu, which
 only appears when the emulator has more than one upstream.
 
+## Tencent Meeting integration
+
+The local emulator also owns a session-independent `tmeet` service. Generated
+homepages import `useMeetingData` from the injected `@homepage/meetings` module;
+the extension supplies fresh data without regenerating the page. The service
+keeps Tencent credentials in the CLI's existing local credential store.
+
+Install the official CLI and configure the local service before connecting:
+
+```powershell
+npm install -g @tencentcloud/tmeet
+$env:MA_TMEET_API_KEY = '<local service secret>'
+$env:MA_TMEET_ORIGINS = 'chrome-extension://<your unpacked extension ID>'
+$env:MA_TMEET_PROXY = 'http://127.0.0.1:7897'
+pnpm emulator
+```
+
+Use the same local secret in the extension's **Tencent Meeting > Local service
+key** setting. If `MA_TMEET_API_KEY` is omitted, the emulator uses the configured
+fixed `MA_UPSTREAM_API_KEY`; the extension uses its existing API key unless a
+separate local service key is set. A client-supplied arbitrary upstream key is
+not sufficient to authorize access to local meetings. `MA_TMEET_ORIGINS` is a
+comma-separated exact allowlist for extension Origin headers. Ordinary web
+origins are rejected. `MA_TMEET_EXECUTABLE` optionally selects the native binary.
+
+Open **Tencent Meeting > Connect**, then click the verified Tencent authorization
+link. The generated page only requests this action; authorization addresses and
+credentials never enter it. An existing valid login is reused. Opening a new
+tab, completing authorization, and pressing refresh fetch today's Beijing-time
+schedule and original summaries for meetings ended in the last seven days.
+Old generated pages need one rebuild to adopt the live-data contract.
+
+Keepalive runs only while the emulator runs, resumes on startup, and uses the
+CLI's authenticated read path to refresh credentials near expiry. It does not
+install a system service. Network failures retain successful data with a stale
+indicator; after worker restart the cache is withheld until the same account is
+verified. Permission or missing-summary states are shown explicitly.
+
+The protected interface is `GET /v1/integrations/tmeet/status`,
+`POST /v1/integrations/tmeet/connect`, and `POST /v1/integrations/tmeet/refresh`.
+All require a matching `Authorization: Bearer ...` local service key. Do not
+expose this single-user service through a public reverse proxy.
+
+The implementation specification is in `docs/specs/tencent-meeting.md` at the
+repository root. GitHub issue #1 remains open for user acceptance.
+
 ## Semantics it reproduces
 
 - **The session runs without the client.** The loop lives here; a client that

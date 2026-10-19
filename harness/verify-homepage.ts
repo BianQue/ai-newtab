@@ -34,11 +34,22 @@ try {
 }
 console.log(`✅ transforms (TSX -> JS, ${source.length}b -> ${js.length}b)`);
 
-// ---- 2. evaluate in a CommonJS shim exposing only React -------------------
+// ---- 2. evaluate using the standalone page's permitted imports ------------
 const module_ = { exports: {} as any };
 const require_ = (name: string) => {
   if (name === "react") return React;
-  fail(`component imported "${name}" — only "react" is allowed (it renders standalone)`);
+  if (name === "@homepage/meetings") return {
+    useMeetingData: () => ({
+      snapshot: null,
+      loading: false,
+      error: "Tencent Meeting is unavailable in the standalone verifier.",
+      stale: false,
+      connectionStatus: "unavailable",
+      refresh() {},
+      connect() {},
+    }),
+  };
+  fail(`component imported "${name}" — only "react" and "@homepage/meetings" are allowed`);
 };
 
 try {

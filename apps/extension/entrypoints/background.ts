@@ -1,6 +1,8 @@
 import { BuildManager } from "@/lib/build-manager";
 import { AGENT_PORT } from "@/lib/protocol";
 import { KEYS } from "@/lib/storage";
+import { meetingManager } from "@/lib/meeting-service";
+import { MEETING_PORT } from "@/lib/meeting-protocol";
 
 /**
  * The service worker is the build host. It owns the agent loop (BuildManager),
@@ -19,6 +21,10 @@ export default defineBackground(() => {
 
   browser.runtime.onConnect.addListener((port) => {
     if (port.name === AGENT_PORT) manager.attach(port);
+    if (port.name === MEETING_PORT && port.sender?.id === browser.runtime.id &&
+      port.sender.url?.startsWith(browser.runtime.getURL("/newtab.html"))) {
+      meetingManager.attach(port);
+    }
   });
 
   // ~1 min is the chrome.alarms floor — fine for a recovery net and the
@@ -31,6 +37,9 @@ export default defineBackground(() => {
   browser.storage.onChanged.addListener((changes, area) => {
     if (area === "local" && (KEYS.upstream in changes || KEYS.upstreamKeys in changes)) {
       void manager.announceUpstreamChoice();
+    }
+    if (area === "local" && (KEYS.baseUrl in changes || KEYS.tmeetKey in changes || KEYS.apiKey in changes)) {
+      void meetingManager.reset();
     }
   });
 

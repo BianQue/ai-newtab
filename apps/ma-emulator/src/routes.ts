@@ -4,6 +4,8 @@ import { publicFile, type FileService } from "./files";
 import type { Registry } from "./registry";
 import { UPSTREAM_KEY_HEADER_PREFIX, type ClientKeys } from "./upstreams";
 import { ApiError, badRequest } from "./util";
+import { timingSafeEqual } from "node:crypto";
+import type { MeetingService } from "./tmeet";
 
 /**
  * HTTP surface. Paths, envelopes and SSE framing follow what
@@ -31,6 +33,7 @@ export interface Services {
   files: FileService;
   engine: SessionEngine;
   log: (line: string) => void;
+  meetings: MeetingService;
 }
 
 const CORS = {
@@ -244,6 +247,9 @@ export function createRouter(s: Services) {
 
   return async function handle(req: Request): Promise<Response> {
     const url = new URL(req.url);
+    if (url.pathname.startsWith("/v1/integrations/tmeet")) {
+      return handleMeetings(req, url, s);
+    }
     if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
 
     let res: Response;
@@ -288,4 +294,39 @@ export function createRouter(s: Services) {
     for (const [k, v] of Object.entries(CORS)) res.headers.set(k, v);
     return res;
   };
+}
+
+async function handleMeetings(req: Request, url: URL, s: Services): Promise<Response> {
+  const headers = new Headers({ "cache-control": "no-store", "vary": "Origin" });
+  const respond = (body: unknown, status = 200) => Response.json(body, { status, headers });
+  const origin = req.headers.get("origin");
+  const host = req.headers.get("host") ?? url.host;
+  let parsedHost: URL;
+  try { parsedHost = new URL("http://" + host); }
+  catch { return respond({ error: "Untrusted host" }, 403); }
+  if (!["localhost", "127.0.0.1", "[::1]"].includes(parsedHost.hostname) ||
+      (s.config.port !== 0 && Number(parsedHost.port || 80) !== s.config.port) ||
+      parsedHost.host !== url.host || parsedHost.username || parsedHost.password || parsedHost.pathname !== "/")
+    return respond({ error: "Untrusted host" }, 403);
+  if (origin && (!(s.config.tmeetOrigins ?? []).includes(origin) || !/^chrome-extension:\/\/[a-p]{32}$/.test(origin)))
+    return respond({ error: "Untrusted origin" }, 403);
+  if (origin) headers.set("access-control-allow-origin", origin);
+  if (req.method === "OPTIONS") {
+    headers.set("access-control-allow-methods", "GET, POST");
+    headers.set("access-control-allow-headers", "authorization, content-type");
+    return new Response(null, { status: 204, headers });
+  }
+  const expected = s.config.tmeetApiKey ?? s.config.upstreams[0]?.apiKey;
+  const provided = req.headers.get("authorization")?.match(/^Bearer (.+)$/)?.[1];
+  if (!expected || !provided || Buffer.byteLength(expected) !== Buffer.byteLength(provided) ||
+      !timingSafeEqual(Buffer.from(expected), Buffer.from(provided)))
+    return respond({ error: "Meeting integration credential required" }, 401);
+  try {
+    if (url.pathname === "/v1/integrations/tmeet/status" && req.method === "GET") return respond(await s.meetings.status());
+    if (url.pathname === "/v1/integrations/tmeet/connect" && req.method === "POST") return respond(await s.meetings.connect());
+    if (url.pathname === "/v1/integrations/tmeet/refresh" && req.method === "POST") return respond(await s.meetings.refreshWithAccount());
+    return respond({ error: "Unsupported meeting route" }, 404);
+  } catch {
+    return respond({ error: "Meeting integration is unavailable" }, 503);
+  }
 }

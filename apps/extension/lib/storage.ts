@@ -5,6 +5,7 @@ import {
   STORAGE_KEYS as AGENT_KEYS,
   type HomepageModel,
   type KVStore,
+  hasMeetingRuntime,
 } from "@homepage/agent-core";
 
 /**
@@ -37,6 +38,8 @@ export const KEYS = {
   rebuildIntervalHours: "autoRebuildIntervalHours",
   /** Throttled mirror of the live build state, for tabs that open while the worker sleeps. */
   buildSnapshot: "buildSnapshot",
+  tmeetKey: "tmeetIntegrationKey",
+  meetingSnapshot: "meetingSnapshot",
 } as const;
 
 export interface Homepage {
@@ -44,10 +47,12 @@ export interface Homepage {
   code: string;
   /** ISO timestamp of when it was built. */
   timestamp: string;
+  meetingRuntimeVersion?: 1;
 }
 
 export interface Settings {
   apiKey: string | null;
+  tmeetKey: string | null;
   /** Gateway origin, already normalized; null means the build-time default or api.anthropic.com. */
   baseUrl: string | null;
   upstream: string | null;
@@ -77,6 +82,7 @@ export const extensionStore: KVStore = {
 export async function loadSettings(): Promise<Settings> {
   const s = await browser.storage.local.get([
     KEYS.apiKey,
+    KEYS.tmeetKey,
     KEYS.baseUrl,
     KEYS.upstream,
     KEYS.upstreamKeys,
@@ -89,6 +95,7 @@ export async function loadSettings(): Promise<Settings> {
   const model = s[KEYS.model] as string | undefined;
   return {
     apiKey: (s[KEYS.apiKey] as string | undefined) ?? null,
+    tmeetKey: (s[KEYS.tmeetKey] as string | undefined) || null,
     baseUrl: (s[KEYS.baseUrl] as string | undefined) || null,
     upstream: (s[KEYS.upstream] as string | undefined) || null,
     upstreamKeys: (s[KEYS.upstreamKeys] as Record<string, string> | undefined) ?? {},
@@ -101,7 +108,7 @@ export async function loadSettings(): Promise<Settings> {
   };
 }
 
-export async function saveSetting<K extends "apiKey" | "baseUrl" | "upstream" | "upstreamKeys" | "systemPrompt" | "blockedSites" | "model" | "autoRebuild" | "rebuildIntervalHours">(
+export async function saveSetting<K extends "apiKey" | "tmeetKey" | "baseUrl" | "upstream" | "upstreamKeys" | "systemPrompt" | "blockedSites" | "model" | "autoRebuild" | "rebuildIntervalHours">(
   key: K,
   value: Settings[K],
 ): Promise<void> {
@@ -189,6 +196,9 @@ export async function loadHomepage(): Promise<Homepage | undefined> {
 }
 
 export async function saveHomepage(code: string): Promise<void> {
-  const homepage: Homepage = { code, timestamp: new Date().toISOString() };
+  const homepage: Homepage = {
+    code, timestamp: new Date().toISOString(),
+    ...(hasMeetingRuntime(code) ? { meetingRuntimeVersion: 1 as const } : {}),
+  };
   await extensionStore.set(KEYS.homepage, homepage);
 }

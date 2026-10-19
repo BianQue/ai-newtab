@@ -1,6 +1,6 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { HOMEPAGE_SYSTEM_PROMPT } from "./prompt";
-import { GET_HISTORY_SCHEMA, GET_PAGE_HTML_SCHEMA } from "./schemas";
+import { GET_HISTORY_SCHEMA, GET_PAGE_HTML_SCHEMA, REQUEST_MEETING_AUTHORIZATION_SCHEMA } from "./schemas";
 import type { KVStore } from "./types";
 
 /** Models offered in Settings. The first is the default. */
@@ -105,6 +105,15 @@ function agentDefinition(model: HomepageModel) {
           "window: visit counts, unique page counts, last-visit timestamps, relevance " +
           "scores, and a few sample page titles per domain. Call this first, once.",
         input_schema: GET_HISTORY_SCHEMA,
+      },
+      {
+        type: "custom",
+        name: "requestMeetingAuthorization",
+        description:
+          "Requests Tencent Meeting connection through the browser's trusted controls. " +
+          "Takes no arguments, URLs or commands. Returns pending/connected/unavailable immediately; " +
+          "never waits for user approval and never exposes authorization URLs, credentials or meeting data.",
+        input_schema: REQUEST_MEETING_AUTHORIZATION_SCHEMA,
       },
       {
         type: "custom",

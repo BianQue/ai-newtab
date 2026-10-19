@@ -30,6 +30,12 @@ import {
 } from "./helpers";
 
 const HOMEPAGE = "export default function PersonalizedHomepage() { return <div>Story number 3</div>; }";
+const MEETING_HOMEPAGE = `import React from 'react';
+import { useMeetingData } from '@homepage/meetings';
+export default function PersonalizedHomepage() {
+  const { snapshot, refresh, connect } = useMeetingData();
+  return <section style={{ color: 'black' }}><button onClick={refresh}>Refresh</button><button onClick={connect}>Connect</button>{snapshot?.meetings.map(m => <p key={m.id}>{m.subject}</p>)}</section>;
+}`;
 
 let h: Harness | undefined;
 afterEach(async () => {
@@ -108,7 +114,7 @@ test("the original orchestrator completes a build against the emulator and leave
   const first = model.requests[0] as any;
   expect(first.system[0].text).toBe(HOMEPAGE_SYSTEM_PROMPT);
   expect(first.system[0].cache_control).toEqual({ type: "ephemeral" });
-  expect(first.tools.map((t: any) => t.name).sort()).toEqual(["getHistory", "getPageHtml", "glob", "grep", "read", "write"]);
+  expect(first.tools.map((t: any) => t.name).sort()).toEqual(["getHistory", "getPageHtml", "glob", "grep", "read", "requestMeetingAuthorization", "write"]);
   const lastMsg = model.requests.at(-1)!.messages.at(-1)! as any;
   expect(lastMsg.content.at(-1).cache_control).toEqual({ type: "ephemeral" });
 
@@ -120,6 +126,106 @@ test("the original orchestrator completes a build against the emulator and leave
   expect(files).toEqual([]);
   expect(await store.get(STORAGE_KEYS.activeSessionId)).toBeUndefined();
   expect(await store.get(STORAGE_KEYS.uploadedFileIds)).toBeUndefined();
+});
+
+test("meeting connection returns pending without exposing trusted host secrets or retaining the build session", async () => {
+  const page = MEETING_HOMEPAGE;
+  const model = fakeModel([
+    (request) => {
+      expect(JSON.stringify(request.messages)).toContain("Use a compact monochrome layout");
+      return reply([toolUse("requestMeetingAuthorization", {})]);
+    },
+    (request) => {
+      expect(lastResults(request)).toEqual([{ name: "requestMeetingAuthorization", text: '{"status":"pending"}', isError: false }]);
+      return reply([toolUse("write", { file_path: OUTPUT_PATH, content: page })]);
+    },
+    () => reply([text("Done.")]),
+  ]);
+  h = startHarness(model);
+  const store = memoryStore();
+  let calls = 0;
+  const result = await runHomepageBuild({
+    client: h.client,
+    store,
+    userSystemPrompt: "Use a compact monochrome layout",
+    bridge: {
+      ...fakeBridge(),
+      requestMeetingAuthorization: async () => {
+        calls++;
+        return { status: "pending", authorizationUrl: "https://secret.example/authorize", token: "private-token" };
+      },
+    },
+  });
+  expect(calls).toBe(1);
+  expect(result.code).toBe(page);
+  expect(result.meetingRuntimeVersion).toBe(1);
+  expect(JSON.stringify(model.requests)).not.toContain("secret.example");
+  expect(JSON.stringify(model.requests)).not.toContain("private-token");
+  expect((await h.client.beta.sessions.retrieve(result.sessionId).catch((error) => error)).status).toBe(404);
+  expect(await store.get(STORAGE_KEYS.activeSessionId)).toBeUndefined();
+  expect(await store.get(STORAGE_KEYS.uploadedFileIds)).toBeUndefined();
+});
+
+test("meeting tools reject arbitrary arguments and unsupported bridges still finish generation", async () => {
+  const bridge = fakeBridge();
+  const model = fakeModel([
+    () => reply([toolUse("requestMeetingAuthorization", { url: "https://untrusted.example" })]),
+    (request) => {
+      expect(lastResults(request)[0].isError).toBe(true);
+      expect(lastResults(request)[0].text).not.toContain("untrusted.example");
+      return reply([toolUse("requestMeetingAuthorization", {})]);
+    },
+    (request) => {
+      expect(lastResults(request)[0].text).toBe('{"status":"unavailable"}');
+      return reply([toolUse("write", { file_path: OUTPUT_PATH, content: HOMEPAGE })]);
+    },
+    () => reply([text("Done.")]),
+  ]);
+  h = startHarness(model);
+  const result = await runHomepageBuild({ client: h.client, store: memoryStore(), bridge });
+  expect(result.code).toBe(HOMEPAGE);
+  expect(result.meetingRuntimeVersion).toBeUndefined();
+  expect(model.remaining()).toBe(0);
+});
+
+test("meeting connection failures cannot leak host exception text into model requests or logs", async () => {
+  const model = fakeModel([
+    () => reply([toolUse("requestMeetingAuthorization", {})]),
+    (request) => {
+      expect(lastResults(request)[0].text).toBe('{"status":"error"}');
+      return reply([toolUse("write", { file_path: OUTPUT_PATH, content: MEETING_HOMEPAGE })]);
+    },
+    () => reply([text("Done.")]),
+  ]);
+  h = startHarness(model);
+  const logs: string[] = [];
+  await runHomepageBuild({
+    client: h.client,
+    store: memoryStore(),
+    callbacks: { onLog: (line) => logs.push(line) },
+    bridge: {
+      ...fakeBridge(),
+      requestMeetingAuthorization: async () => { throw new Error("private-token"); },
+    },
+  });
+  expect(JSON.stringify(model.requests)).not.toContain("private-token");
+  expect(JSON.stringify(logs)).not.toContain("private-token");
+});
+
+test("a capable host rejects a static meeting replacement and still cleans up the session", async () => {
+  const model = fakeModel([
+    () => reply([toolUse("write", { file_path: OUTPUT_PATH, content: HOMEPAGE })]),
+    () => reply([text("Done.")]),
+  ]);
+  h = startHarness(model);
+  const store = memoryStore();
+  await expect(runHomepageBuild({
+    client: h.client,
+    store,
+    bridge: { ...fakeBridge(), requestMeetingAuthorization: async () => ({ status: "pending" }) },
+  })).rejects.toThrow("missing the required @homepage/meetings");
+  expect(await store.get(STORAGE_KEYS.activeSessionId)).toBeUndefined();
+  expect((await h.client.beta.sessions.list()).data).toEqual([]);
 });
 
 test("agents and environments are created once and reused", async () => {
