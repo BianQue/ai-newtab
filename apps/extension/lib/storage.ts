@@ -141,6 +141,14 @@ export async function fetchUpstreams(baseUrl: string | undefined): Promise<Upstr
   }
 }
 
+export function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
+
 /**
  * fetch for the build's Anthropic client: adds the emulator's headers from
  * storage on every request — `x-ma-upstream` (once the user has chosen) and an

@@ -140,7 +140,8 @@ the key as `x-ma-key-<name>` (e.g. `x-ma-key-fallback-2`), alongside its
 `x-api-key` for the primary. Each key is held in memory per session and only
 ever sent to the upstream it names. A request updates just the keys it carries;
 an empty header value forgets that key. A fallback with no key is skipped. The
-extension's Settings shows a key field for each such fallback.
+extension's key screen and Settings both show a key field for each such
+fallback.
 
 ## Not emulated
 

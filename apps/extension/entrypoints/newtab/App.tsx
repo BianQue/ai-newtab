@@ -67,23 +67,27 @@ export default function App() {
   }, []);
 
   const saveKey = useCallback(
-    async (key: string, nextBaseUrl: string | null) => {
+    async (key: string, nextBaseUrl: string | null, keys: Record<string, string>) => {
       // An upstream choice (and a fallback key) names one of the old endpoint's
       // gateways; it means nothing elsewhere, and a key mustn't follow it there.
+      // On the same endpoint the form's fallback keys update the saved ones
+      // (a cleared field stays "" so the emulator forgets that key).
       const gatewayChanged = nextBaseUrl !== baseUrl;
+      const nextKeys = gatewayChanged
+        ? Object.fromEntries(Object.entries(keys).filter(([, k]) => k))
+        : { ...upstreamKeys, ...keys };
       await Promise.all([
         saveSetting("apiKey", key),
         saveSetting("baseUrl", nextBaseUrl),
-        ...(gatewayChanged ? [saveSetting("upstream", null), saveSetting("upstreamKeys", {})] : []),
+        saveSetting("upstreamKeys", nextKeys),
+        ...(gatewayChanged ? [saveSetting("upstream", null)] : []),
       ]);
-      if (gatewayChanged) {
-        setUpstream(null);
-        setUpstreamKeys({});
-      }
+      if (gatewayChanged) setUpstream(null);
+      setUpstreamKeys(nextKeys);
       setBaseUrl(nextBaseUrl);
       setApiKey(key);
     },
-    [baseUrl],
+    [baseUrl, upstreamKeys],
   );
 
   /** Back to the key screen, prefilled with the current gateway. */
@@ -134,7 +138,7 @@ export default function App() {
   }, []);
 
   if (loading) return <div style={{ padding: 20, textAlign: "center" }}>Loading…</div>;
-  if (!apiKey) return <ApiKeySetup initialBaseUrl={baseUrl} onSave={saveKey} />;
+  if (!apiKey) return <ApiKeySetup initialBaseUrl={baseUrl} initialUpstreamKeys={upstreamKeys} onSave={saveKey} />;
 
   // With no homepage to fall back to, a running build takes over the tab.
   if (state.running && (!renderedCode || viewProgress)) {

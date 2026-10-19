@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { MODEL_CHOICES, normalizeBlockList, type HomepageModel } from "@homepage/agent-core";
 import { REBUILD_INTERVAL_CHOICES } from "@/lib/auto-rebuild";
-import { fetchUpstreams, type UpstreamInfo } from "@/lib/storage";
+import { fetchUpstreams, hostOf, type UpstreamInfo } from "@/lib/storage";
 import { btn } from "./ui";
 
 export function SettingsModal({
@@ -258,12 +258,4 @@ function UpstreamKeyField({
       />
     </label>
   );
-}
-
-function hostOf(url: string): string {
-  try {
-    return new URL(url).host;
-  } catch {
-    return url;
-  }
 }
