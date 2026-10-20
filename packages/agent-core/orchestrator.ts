@@ -156,6 +156,9 @@ export async function runHomepageBuild(opts: RunOptions): Promise<HomepageBuildR
         break;
       case "session.error":
         emit.log(`session.error: ${JSON.stringify(event)}`);
+        if (event.error.retry_status.type === "terminal" || event.error.retry_status.type === "exhausted") {
+          throw new Error(`Homepage generation failed: ${event.error.message}`);
+        }
         break;
     }
   };

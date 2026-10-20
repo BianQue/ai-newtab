@@ -1,5 +1,5 @@
 import type Anthropic from "@anthropic-ai/sdk";
-import { HOMEPAGE_SYSTEM_PROMPT } from "./prompt";
+import { buildHomepageSystemPrompt } from "./homepage-prompt";
 import { GET_HISTORY_SCHEMA, GET_PAGE_HTML_SCHEMA, REQUEST_MEETING_AUTHORIZATION_SCHEMA } from "./schemas";
 import type { KVStore } from "./types";
 
@@ -82,7 +82,7 @@ function agentDefinition(model: HomepageModel) {
     name: AGENT_NAME,
     model,
     description: "Builds a personalized homepage from the user's browsing history.",
-    system: HOMEPAGE_SYSTEM_PROMPT,
+    system: buildHomepageSystemPrompt(),
     tools: [
       {
         type: "agent_toolset_20260401",

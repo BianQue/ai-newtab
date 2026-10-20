@@ -6,7 +6,7 @@
  */
 import { afterEach, expect, test } from "bun:test";
 import {
-  HOMEPAGE_SYSTEM_PROMPT,
+  buildHomepageSystemPrompt,
   OUTPUT_PATH,
   STORAGE_KEYS,
   buildHistoryDigest,
@@ -41,6 +41,33 @@ let h: Harness | undefined;
 afterEach(async () => {
   await h?.dispose();
   h = undefined;
+});
+
+test("upstream rejection reaches the build error instead of a missing homepage message", async () => {
+  h = startHarness(fakeModel([() => {
+    throw Object.assign(new Error('403 Request not allowed'), { status: 403 });
+  }]));
+  const store = memoryStore();
+  const phases: RunPhase[] = [];
+  const error = await runHomepageBuild({ client: h.client, bridge: fakeBridge(), store,
+    callbacks: { onPhase: (phase) => phases.push(phase) },
+  }).catch((error: Error) => error);
+  expect(error).toBeInstanceOf(Error);
+  expect((error as Error).message).toContain("403 Request not allowed");
+  expect((error as Error).message).not.toContain("Agent produced no homepage");
+  expect(phases).not.toContain("writing");
+  expect(phases).toContain("cleanup");
+  expect(await store.get(STORAGE_KEYS.activeSessionId)).toBeUndefined();
+}, 20_000);
+
+test("retryable upstream errors still allow a successful homepage build", async () => {
+  h = startHarness(fakeModel([
+    () => { throw Object.assign(new Error("temporary upstream failure"), { status: 503 }); },
+    () => reply([toolUse("write", { file_path: OUTPUT_PATH, content: HOMEPAGE })]),
+    () => reply([text("Done.")]),
+  ]));
+  const result = await runHomepageBuild({ client: h.client, bridge: fakeBridge(), store: memoryStore() });
+  expect(result.code).toBe(HOMEPAGE);
 });
 
 /** A plausible build: history → scrape → glob+grep → read → write → done. Asserts what the model sees at each step. */
@@ -112,7 +139,7 @@ test("the original orchestrator completes a build against the emulator and leave
 
   // What reached the model: the agent's system prompt, the enabled toolset (no bash), custom tools, cache breakpoints.
   const first = model.requests[0] as any;
-  expect(first.system[0].text).toBe(HOMEPAGE_SYSTEM_PROMPT);
+  expect(first.system[0].text).toBe(buildHomepageSystemPrompt());
   expect(first.system[0].cache_control).toEqual({ type: "ephemeral" });
   expect(first.tools.map((t: any) => t.name).sort()).toEqual(["getHistory", "getPageHtml", "glob", "grep", "read", "requestMeetingAuthorization", "write"]);
   const lastMsg = model.requests.at(-1)!.messages.at(-1)! as any;

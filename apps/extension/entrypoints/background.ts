@@ -15,6 +15,7 @@ import { MEETING_PORT } from "@/lib/meeting-protocol";
  * kill.
  */
 const HEARTBEAT_ALARM = "homepage-heartbeat";
+const MEETING_ALARM = "meeting-refresh";
 
 export default defineBackground(() => {
   const manager = new BuildManager();
@@ -30,8 +31,12 @@ export default defineBackground(() => {
   // ~1 min is the chrome.alarms floor — fine for a recovery net and the
   // scheduled rebuild check.
   browser.alarms.create(HEARTBEAT_ALARM, { periodInMinutes: 1 });
+  browser.alarms.get(MEETING_ALARM).then((alarm) => {
+    if (!alarm) browser.alarms.create(MEETING_ALARM, { periodInMinutes: 10 });
+  });
   browser.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === HEARTBEAT_ALARM) void manager.tick();
+    if (alarm.name === MEETING_ALARM) void meetingManager.refresh(false);
   });
 
   browser.storage.onChanged.addListener((changes, area) => {

@@ -20,7 +20,7 @@ let pending = false;
 let failRefresh = false;
 let refreshRequests = 0;
 const requestOrigins = new Set<string>();
-const originalSummary = '<script>window.meetingInjected=true</script> Original summary.\nNext action remains unchanged.';
+const originalSummary = '<script>window.meetingInjected=true</script> Original summary.\n' + 'Next action remains unchanged. Long original meeting notes.\n'.repeat(80);
 const authUrl = "https://meeting.tencent.com/marketplace/tencentmeeting-cli-auth.html?code=test-fixture";
 const fixture = () => ({
   schemaVersion: 1, revision: ++revision, fetchedAt: new Date().toISOString(), timezone: "Asia/Shanghai",
@@ -56,13 +56,18 @@ const code = (variant: "green" | "red") => `import React from 'react';
 import { useMeetingData } from '@homepage/meetings';
 export default function PersonalizedHomepage() {
   const {snapshot,loading,error,stale,refresh,connect} = useMeetingData();
+  const [expanded, setExpanded] = React.useState(null);
+  const status = loading ? 'Updating' : stale ? 'Stale' : 'Ready';
   return <main style={{fontFamily:'system-ui',padding:24,maxWidth:900,margin:'auto',color:'${variant === "green" ? "#12583d" : "#8a2440"}',overflowWrap:'anywhere'}}>
     <h1>Meeting dashboard ${variant}</h1>
-    <button onClick={refresh}>Refresh data</button> <button onClick={connect}>Connect account</button>
-    <p role="status">{loading ? 'Loading' : stale ? 'Stale' : 'Ready'}</p>
-    {error && <p role="alert">{error}</p>}
+    <span role="img" aria-label={status} title={status + ' ' + (snapshot?.fetchedAt || '') + ' ' + (error || '')} style={{display:'inline-block',width:8,height:8,borderRadius:'50%',background:loading?'#888':stale?'#b07819':'#34865a'}} />
+    <button onClick={connect}>Connect account</button>
     <section aria-label="Today"><h2>Today</h2>{snapshot?.meetings.map(m => <article key={m.id}><h3>{m.subject}</h3></article>)}</section>
-    <section aria-label="Last seven days"><h2>Last seven days</h2>{snapshot?.summaries.map(m => <p data-summary key={m.id} style={{whiteSpace:'pre-wrap'}}>{m.summary}</p>)}</section>
+    <section aria-label="Last seven days" style={{maxHeight:480,overflowY:'auto'}}><h2>Last seven days</h2>{snapshot?.summaries.map(m => <div key={m.id}>
+      <h3>{m.subject}</h3>
+      <p data-summary style={{whiteSpace:'pre-wrap',lineHeight:'24px',margin:0,...(expanded===m.id?{maxHeight:'min(360px, 50vh)',overflowY:'auto'}:{display:'-webkit-box',WebkitLineClamp:3,WebkitBoxOrient:'vertical',overflow:'hidden'})}}>{m.summary}</p>
+      <button aria-expanded={expanded===m.id} onClick={()=>setExpanded(expanded===m.id?null:m.id)}>{expanded===m.id?'Collapse summary':'Expand summary'}</button>
+    </div>)}</section>
   </main>;
 }`;
 
@@ -112,22 +117,34 @@ try {
     throw new Error(`Sandpack preview did not render. Frames: ${page.frames().map((f: any) => f.url()).join(", ")}`);
   };
   await seed(code("green"));
+  const refreshAlarm = await page.evaluate(async () => (globalThis as any).chrome.alarms.get('meeting-refresh'));
+  assert.equal(refreshAlarm?.periodInMinutes, 10, 'browser schedules meeting refresh every ten minutes');
   await page.setViewportSize({ width: 1365, height: 900 });
   let frame = await getPreview();
   await frame.getByRole("heading", { name: "Meeting 1", exact: true }).waitFor({ timeout: 30_000 });
   assert.equal(await frame.locator("[data-summary]").textContent(), originalSummary);
   assert.equal(await frame.evaluate(() => (window as any).meetingInjected), undefined);
+  assert(await frame.locator('[data-summary]').evaluate((el: HTMLElement) => el.clientHeight <= 72), 'summary preview is at most three lines');
+  await frame.getByRole('button', { name: 'Expand summary' }).click();
+  assert(await frame.locator('[data-summary]').evaluate((el: HTMLElement) => el.clientHeight <= 360 && el.scrollHeight > el.clientHeight), 'expanded original scrolls within a bounded height');
+  const refreshData = async () => {
+    await page.getByRole('button', { name: /^Tencent Meeting/ }).click();
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await page.getByRole('button', { name: /^Tencent Meeting/ }).click();
+  };
   const before = await page.evaluate(async () => (await (globalThis as any).chrome.storage.local.get("homepageData")).homepageData.code);
   const beforeCount = await frame.locator("article").count();
-  await frame.getByRole("button", { name: "Refresh data" }).click();
+  await refreshData();
   await frame.waitForFunction((count: number) => document.querySelectorAll("article").length > count, beforeCount);
   const after = await page.evaluate(async () => (await (globalThis as any).chrome.storage.local.get("homepageData")).homepageData.code);
   assert.equal(after, before, "refresh preserves generated code");
+  assert.equal(await frame.getByRole('button', { name: 'Collapse summary' }).getAttribute('aria-expanded'), 'true', 'refresh preserves expanded state');
+  assert.equal(await frame.locator('[role="alert"], [role="status"]').count(), 0, 'background updates do not announce or show banners');
   assert.equal(await page.evaluate(async () => (await (globalThis as any).chrome.storage.local.get("activeSessionId")).activeSessionId), undefined);
   await page.screenshot({ path: join(output, "desktop-green.png"), fullPage: true });
   failRefresh = true;
-  await frame.getByRole("button", { name: "Refresh data" }).click();
-  await frame.getByRole("status").filter({ hasText: "Stale" }).waitFor();
+  await refreshData();
+  await frame.getByRole("img", { name: "Stale", exact: true }).waitFor();
   assert(await frame.locator("article").count() > 0, "failure retains previous rows");
   failRefresh = false;
   const pagesBeforeConnect = context.pages().length;
@@ -144,13 +161,17 @@ try {
   await authPage.waitForURL(authUrl);
   await authPage.close();
   pending = false;
-  await frame.getByRole("status").filter({ hasText: /^Ready$/ }).waitFor({ timeout: 15_000 });
+  await frame.getByRole("img", { name: "Ready", exact: true }).waitFor({ timeout: 15_000 });
   await seed(code("red"));
   await page.setViewportSize({ width: 390, height: 844 });
   frame = await getPreview();
   await frame.getByRole("heading", { name: "Meeting 1", exact: true }).waitFor({ timeout: 30_000 });
   assert.equal(await frame.locator("h1").evaluate((el: HTMLElement) => getComputedStyle(el).color), "rgb(138, 36, 64)");
   assert(await frame.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), "mobile preview does not overflow");
+  assert(await frame.locator('[data-summary]').evaluate((el: HTMLElement) => el.clientHeight <= 72), 'mobile summary is collapsed');
+  await frame.getByRole('button', { name: 'Expand summary' }).click();
+  assert(await frame.locator('[data-summary]').evaluate((el: HTMLElement) => el.clientHeight <= Math.min(360, innerHeight / 2) + 1 && el.scrollHeight > el.clientHeight), 'mobile expanded summary is bounded');
+  await frame.getByRole('button', { name: 'Collapse summary' }).click();
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), "mobile host does not overflow");
   const controls = await page.getByRole("button", { name: /^Tencent Meeting/ }).boundingBox();
   const preview = await page.locator("iframe").first().boundingBox();

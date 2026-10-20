@@ -1,6 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, spyOn } from "bun:test";
 import { isMeetingRefreshResult, isMeetingSnapshot, type MeetingSnapshot } from "../packages/agent-core";
-import { MeetingManager, type MeetingDependencies } from "../apps/extension/lib/meeting-manager";
+import { MeetingManager, MEETING_REFRESH_INTERVAL_MS, type MeetingDependencies } from "../apps/extension/lib/meeting-manager";
 import {
   INITIAL_MEETING_STATE, isMeetingCommand, isTrustedAuthorizationUrl,
   MEETING_MESSAGE, meetingFrameAction, meetingFrameState,
@@ -24,6 +24,49 @@ const io = (request: MeetingDependencies["request"]): MeetingDependencies => ({
 });
 
 describe("meeting worker boundary", () => {
+  test("new tabs share a ten-minute cadence, including after failed requests", async () => {
+    let now = 1_000_000;
+    const clock = spyOn(Date, "now").mockImplementation(() => now);
+    let calls = 0;
+    const manager = new MeetingManager(io(async (route) => {
+      if (route === "status") return { status: "connected" };
+      calls++;
+      throw new Error("Offline");
+    }));
+    try {
+      await manager.open();
+      now += MEETING_REFRESH_INTERVAL_MS - 1;
+      await manager.open();
+      expect(calls).toBe(1);
+      now++;
+      await manager.open();
+      expect(calls).toBe(2);
+    } finally { clock.mockRestore(); }
+  });
+
+  test("worker restart reuses fresh same-account data but manual refresh still works", async () => {
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    let calls = 0;
+    const deps = io(async (route) => {
+      if (route === "status") return { status: "connected", accountRevision: "a".repeat(64) };
+      calls++;
+      return snapshot(2);
+    });
+    deps.load = async () => ({ accountRevision: "a".repeat(64),
+      snapshot: { ...snapshot(), fetchedAt: new Date(now - 60_000).toISOString() } });
+    const manager = new MeetingManager(deps);
+    try {
+      await manager.open();
+      expect(calls).toBe(0);
+      expect(manager.getState().stale).toBe(false);
+      expect(manager.getState().snapshot?.revision).toBe(1);
+      await manager.refresh();
+      expect(calls).toBe(1);
+      expect(manager.getState().snapshot?.revision).toBe(2);
+    } finally { clock.mockRestore(); }
+  });
+
   test("coalesces cross-tab refresh and preserves the last successful snapshot on failure", async () => {
     let calls = 0;
     let fail = false;

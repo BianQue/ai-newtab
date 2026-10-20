@@ -7,6 +7,8 @@ import {
 } from "@homepage/agent-core";
 import { INITIAL_MEETING_STATE, isMeetingCommand, type MeetingState } from "./meeting-protocol";
 
+export const MEETING_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
+
 interface MeetingPort {
   postMessage(message: unknown): void;
   onMessage: { addListener(listener: (message: unknown) => void): void };
@@ -72,8 +74,7 @@ export class MeetingManager {
   }
 
   async open() {
-    // Tabs opened together share the same fetch and a short cooldown.
-    if (Date.now() - this.lastRefresh > 5_000) await this.refresh();
+    if (!this.lastRefresh || Date.now() - this.lastRefresh >= MEETING_REFRESH_INTERVAL_MS) await this.refresh(false);
   }
 
   async reset() {
@@ -91,7 +92,7 @@ export class MeetingManager {
     await this.refresh();
   }
 
-  refresh(): Promise<void> {
+  refresh(force = true): Promise<void> {
     if (this.refreshTask) return this.refreshTask;
     const generation = this.generation;
     this.publish({ loading: true, error: null });
@@ -121,6 +122,14 @@ export class MeetingManager {
           await this.io.clear();
         }
         if (rawAuth.status === "pending") this.schedulePoll();
+        if (!force && rawAuth.status === "connected" && rawAuth.accountRevision &&
+          cache?.accountRevision === rawAuth.accountRevision && isMeetingSnapshot(cache.snapshot)) {
+          const age = Date.now() - Date.parse(cache.snapshot.fetchedAt);
+          if (age >= 0 && age < MEETING_REFRESH_INTERVAL_MS) {
+            this.publish({ snapshot: cache.snapshot, stale: cache.snapshot.status !== "ready" });
+            return;
+          }
+        }
         const response = await this.io.request("refresh");
         if (generation !== this.generation) return;
         if (!isMeetingRefreshResult(response)) throw new Error("Invalid meeting data response.");
@@ -155,7 +164,11 @@ export class MeetingManager {
           stale: Boolean(this.state.snapshot),
         });
       } finally {
-        if (generation === this.generation) this.publish({ loading: false });
+        if (generation === this.generation) {
+          // Failed requests use the same cadence instead of retrying on every new tab.
+          this.lastRefresh = Date.now();
+          this.publish({ loading: false });
+        }
         this.refreshTask = null;
       }
     })();
